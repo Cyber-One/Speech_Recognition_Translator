@@ -11,6 +11,7 @@ This file is the single setup guide for firmware flashing, dictionary preparatio
 3. Copy required files into `/microsd/`:
    - `Language.dat` (640 bytes)
    - `Dictionary.dat` (your populated dictionary)
+  - `UserList.txt` (user ID to name mapping; ID 0 is Unknown)
    - `PhonemeList.txt` (reference)
 
 ### Step 2: Generate/Prepare Dictionary Files
@@ -102,16 +103,17 @@ add_record('Dictionary.dat', 1, b'\x05\x10\x15\x21\x00\x00\x00\x00\x00\x00\x00\x
 - `dict_add_unknown_word(seq)` appends unknown words into `NewWords.dat`
 - `dict_merge_new_words()` merges `NewWords.dat` into `Dictionary.dat`
 - `create_language_file()` ensures `Language.dat` exists
+- `create_user_list_file()` ensures `UserList.txt` exists
 
 ## Troubleshooting
 
-| Issue | Check |
-|------|-------|
-| `f_mount` failed | Verify SPI wiring and SD formatting |
-| `f_open Dictionary.dat` failed | Confirm `/microsd/Dictionary.dat` exists |
-| Words not found | Verify sequence encoding and sort order |
-| NewWords grows too large | Run `dict_merge_new_words()` periodically |
-| No output words | Verify stage-2 devices, I2C pull-ups, word-ready lines |
+| Issue                          | Check                                                   |
+|--------------------------------|---------------------------------------------------------|
+| `f_mount` failed               | Verify SPI wiring and SD formatting                     |
+| `f_open Dictionary.dat` failed | Confirm `/microsd/Dictionary.dat` exists                |
+| Words not found                | Verify sequence encoding and sort order                 |
+| NewWords grows too large       | Run `dict_merge_new_words()` periodically               |
+| No output words                | Verify stage-2 devices, I2C pull-ups, word-ready lines  |
 
 ## Hardware Pinout
 
@@ -126,6 +128,6 @@ Fault outputs: 11-15
 
 ## References
 
-- https://www.sdcard.org/
-- http://elm-chan.org/fsw/ff/
-- https://datasheets.raspberrypi.com/rp2040/rp2040-datasheet.pdf
+- <https://www.sdcard.org/>
+- <http://elm-chan.org/fsw/ff/>
+- <https://datasheets.raspberrypi.com/rp2040/rp2040-datasheet.pdf>

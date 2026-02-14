@@ -97,11 +97,12 @@ Mode table:
 The Translator reads each stage‑2 device via I2C0 (master):
 
 - `0x01` → FIFO length (16‑bit)
-- `0x05` → FIFO entry (32‑bit):
+- `0x05` → FIFO entry (40‑bit):
   - Byte 1: neuron ID
   - Byte 2: max value
   - Byte 3: female value
   - Byte 4: male value
+  - Byte 5: user ID (0 = unknown, 1-20 = user)
 
 ## Phoneme Buffering
 
@@ -113,6 +114,7 @@ The microSD card holds:
 
 - **Weights/Bias** for stage‑2 devices
 - **Translation dictionary**
+- **UserList.txt** for user ID → name mapping
 
 Dictionary entries:
 

@@ -142,6 +142,7 @@ typedef struct {
     uint8_t max_val;
     uint8_t female_val;
     uint8_t male_val;
+    uint8_t user_id;
 } stage2_entry_t;
 
 #define PHONEME_SEQ_LEN 15
@@ -161,10 +162,13 @@ typedef struct {
 #define LANG_UNKNOWN 0
 #define LANG_ENGLISH 1
 
+#define USER_ID_UNKNOWN 0
+#define USER_ID_MAX 20
+
 // Stage 2 network dimensions
 #define INPUT_NEURONS 41
-#define HIDDEN_NEURONS 50
-#define OUTPUT_NEURONS 50
+#define HIDDEN_NEURONS 100
+#define OUTPUT_NEURONS 200
 
 #define W1_SIZE (HIDDEN_NEURONS * INPUT_NEURONS)
 #define B1_SIZE (HIDDEN_NEURONS)
@@ -480,6 +484,93 @@ static bool create_language_file(void) {
     return true;
 }
 
+static bool create_user_list_file(void) {
+    FIL user_file;
+    FRESULT res = f_open(&user_file, "0:/microsd/UserList.txt", FA_CREATE_NEW | FA_WRITE);
+
+    if (res == FR_EXIST) {
+        printf("INFO: UserList.txt already exists\n");
+        return true;
+    }
+
+    if (res != FR_OK) {
+        printf("ERROR: f_open UserList.txt failed with code %d\n", res);
+        return false;
+    }
+
+    UINT bw;
+    const char *header = "# id,name\r\n0,Unknown\r\n";
+    res = f_write(&user_file, header, (UINT)strlen(header), &bw);
+    if (res != FR_OK) {
+        f_close(&user_file);
+        return false;
+    }
+
+    for (uint8_t id = 1; id <= USER_ID_MAX; id++) {
+        char line[32];
+        int n = snprintf(line, sizeof(line), "%u,User%02u\r\n", id, id);
+        res = f_write(&user_file, line, (UINT)n, &bw);
+        if (res != FR_OK) {
+            f_close(&user_file);
+            return false;
+        }
+    }
+
+    f_close(&user_file);
+    printf("INFO: UserList.txt created with IDs 0..%u\n", USER_ID_MAX);
+    return true;
+}
+
+static bool user_lookup_name(uint8_t user_id, char *name_out, size_t name_out_len) {
+    if (!name_out || name_out_len < 2) return false;
+
+    if (user_id == USER_ID_UNKNOWN) {
+        strncpy(name_out, "Unknown", name_out_len - 1);
+        name_out[name_out_len - 1] = '\0';
+        return true;
+    }
+
+    FIL user_file;
+    FRESULT res = f_open(&user_file, "0:/microsd/UserList.txt", FA_READ | FA_OPEN_EXISTING);
+    if (res != FR_OK) {
+        strncpy(name_out, "Unknown", name_out_len - 1);
+        name_out[name_out_len - 1] = '\0';
+        return false;
+    }
+
+    char line[96];
+    bool found = false;
+
+    while (f_gets(line, sizeof(line), &user_file)) {
+        if (line[0] == '#' || line[0] == '\r' || line[0] == '\n') continue;
+
+        char *comma = strchr(line, ',');
+        if (!comma) continue;
+        *comma = '\0';
+
+        int id = atoi(line);
+        if (id != user_id) continue;
+
+        char *name = comma + 1;
+        char *eol = strpbrk(name, "\r\n");
+        if (eol) *eol = '\0';
+
+        strncpy(name_out, name, name_out_len - 1);
+        name_out[name_out_len - 1] = '\0';
+        found = true;
+        break;
+    }
+
+    f_close(&user_file);
+
+    if (!found) {
+        strncpy(name_out, "Unknown", name_out_len - 1);
+        name_out[name_out_len - 1] = '\0';
+    }
+
+    return found;
+}
+
 static bool dict_add_unknown_word(const uint8_t *seq) {
     if (!sd_ready) return false;
     
@@ -544,6 +635,11 @@ static bool dict_init(void) {
     // Create Language.dat if it doesn't exist
     if (!create_language_file()) {
         printf("WARNING: failed to create Language.dat\n");
+    }
+
+    // Create UserList.txt if it doesn't exist
+    if (!create_user_list_file()) {
+        printf("WARNING: failed to create UserList.txt\n");
     }
 
     res = f_open(&dict_file, "0:/microsd/Dictionary.dat", FA_READ | FA_OPEN_EXISTING);
@@ -1278,15 +1374,16 @@ static bool stage2_read_fifo_len(uint8_t addr, uint16_t *len_out) {
 
 static bool stage2_read_fifo_entry(uint8_t addr, stage2_entry_t *entry) {
     uint8_t reg = STAGE2_REG_FIFO_READ;
-    uint8_t buf[4] = {0};
+    uint8_t buf[5] = {0};
     int w = i2c_write_blocking(I2C_STAGE2_PORT, addr, &reg, 1, true);
     if (w != 1) return false;
-    int r = i2c_read_blocking(I2C_STAGE2_PORT, addr, buf, 4, false);
-    if (r != 4) return false;
+    int r = i2c_read_blocking(I2C_STAGE2_PORT, addr, buf, 5, false);
+    if (r != 5) return false;
     entry->max_id = buf[0];
     entry->max_val = buf[1];
     entry->female_val = buf[2];
     entry->male_val = buf[3];
+    entry->user_id = buf[4];
     return true;
 }
 
@@ -1295,6 +1392,9 @@ static bool stage2_read_fifo_entry(uint8_t addr, stage2_entry_t *entry) {
 // ==============================
 static void handle_stage2_entry(uint8_t beam_idx, const stage2_entry_t *entry) {
     beam_seq_t *seq = &beam_sequences[beam_idx];
+
+    char user_name[32];
+    user_lookup_name(entry->user_id, user_name, sizeof(user_name));
 
     // Append phoneme id to sequence (shift if full)
     if (seq->count < PHONEME_SEQ_LEN) {
@@ -1313,8 +1413,9 @@ static void handle_stage2_entry(uint8_t beam_idx, const stage2_entry_t *entry) {
     if (dict_lookup_word(seq->seq, word, sizeof(word))) {
         const char *gender = (entry->female_val >= entry->male_val) ? "female" : "male";
         uint8_t conf = (entry->female_val >= entry->male_val) ? entry->female_val : entry->male_val;
-        char line[128];
-        snprintf(line, sizeof(line), "beam=%u word=%s gender=%s conf=%u", beam_idx, word, gender, conf);
+        char line[160];
+        snprintf(line, sizeof(line), "beam=%u user_id=%u user=%s word=%s gender=%s conf=%u",
+                 beam_idx, entry->user_id, user_name, word, gender, conf);
         output_send_line(line);
         if (beam_idx == TRAIN_BEAM_INDEX) {
             recent_words_push(word, gender);
@@ -1328,8 +1429,9 @@ static void handle_stage2_entry(uint8_t beam_idx, const stage2_entry_t *entry) {
             snprintf(unrec_word, sizeof(unrec_word), "UnRecognised%02d", unrecognised_counter - 1);
             const char *gender = (entry->female_val >= entry->male_val) ? "female" : "male";
             uint8_t conf = (entry->female_val >= entry->male_val) ? entry->female_val : entry->male_val;
-            char line[128];
-            snprintf(line, sizeof(line), "beam=%u word=%s gender=%s conf=%u [NEW]", beam_idx, unrec_word, gender, conf);
+            char line[160];
+            snprintf(line, sizeof(line), "beam=%u user_id=%u user=%s word=%s gender=%s conf=%u [NEW]",
+                     beam_idx, entry->user_id, user_name, unrec_word, gender, conf);
             output_send_line(line);
             if (beam_idx == TRAIN_BEAM_INDEX) {
                 recent_words_push(unrec_word, gender);
