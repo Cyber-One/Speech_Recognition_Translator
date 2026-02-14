@@ -1,0 +1,10 @@
+/build/
+*.uf2
+*.dis
+*.elf
+*.bin
+*.hex
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+compile_commands.json
