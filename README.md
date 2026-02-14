@@ -131,3 +131,166 @@ ninja
 ## Status
 
 This module currently provides the **hardware interface** and **FIFO ingest** scaffolding. Dictionary parsing, SD card I/O, and upstream I2C output are stubbed for implementation.
+
+## Multilingual Support & Unknown Word Tracking
+
+The translator supports multiple languages through a language-ID system and tracks unrecognized phoneme sequences using a two-file dictionary design:
+
+- **Dictionary.dat**: Main sorted dictionary (42 bytes/record)
+- **NewWords.dat**: Sequential unknown-word file (42 bytes/record)
+- **Language.dat**: Language ID ↔ name mapping (32 bytes/record, 20 entries)
+
+### Two-File Architecture
+
+```txt
+Dictionary.dat (Sorted)         NewWords.dat (Sequential)
+├─ Maintains sort order         ├─ Unknown words appended
+├─ Binary search capable        │  without sort overhead
+├─ Stable, pre-validated data   └─ Linear search within file
+└─ Primary lookup source           (typically <100 entries)
+
+Lookup Flow:
+1. Search Dictionary.dat
+2. If not found, search NewWords.dat
+3. If still not found, append to NewWords.dat
+```
+
+### Unknown Word Lifecycle
+
+```txt
+Phoneme Sequence Detected
+    ↓
+dict_lookup_word(seq) → NOT FOUND
+    ↓
+dict_add_unknown_word(seq)
+    ├─ Generate label: UnRecognisedXX
+    ├─ Set language_id = 0
+    └─ Append to NewWords.dat
+```
+
+### File Specifications
+
+#### Language.dat
+
+- **Purpose**: Language ID mapping
+- **Format**: 32 bytes/record
+  - Bytes 0-1: Language ID (little-endian uint16)
+  - Bytes 2-31: Language name (null-terminated, null-padded ASCII)
+- **Entries**: 20 predefined languages
+- **Size**: 640 bytes
+- **Location**: `/microsd/Language.dat`
+
+#### Dictionary.dat
+
+- **Purpose**: Primary sorted lookup table
+- **Format**: 42 bytes/record
+  - Bytes 0-1: Language ID
+  - Bytes 2-16: Phoneme sequence (15 bytes)
+  - Bytes 17-41: Word (25 bytes, null-padded)
+- **Sort Order**: Lexicographic by phoneme sequence
+- **Location**: `/microsd/Dictionary.dat`
+
+#### NewWords.dat
+
+- **Purpose**: Unknown-word accumulation during runtime
+- **Format**: 42 bytes/record (same as Dictionary.dat)
+- **Language ID**: Always 0 (unknown)
+- **Word Label**: `UnRecognised00` ... `UnRecognised99`
+- **Location**: `/microsd/NewWords.dat`
+
+### Language IDs
+
+```c
+#define LANG_UNKNOWN      0
+#define LANG_ENGLISH      1
+#define LANG_SPANISH      2
+#define LANG_FRENCH       3
+#define LANG_GERMAN       4
+#define LANG_ITALIAN      5
+#define LANG_PORTUGUESE   6
+#define LANG_RUSSIAN      7
+#define LANG_CHINESE      8
+#define LANG_JAPANESE     9
+#define LANG_KOREAN      10
+#define LANG_ARABIC      11
+#define LANG_HINDI       12
+#define LANG_DUTCH       13
+#define LANG_SWEDISH     14
+#define LANG_TURKISH     15
+#define LANG_POLISH      16
+#define LANG_GREEK       17
+#define LANG_HEBREW      18
+#define LANG_VIETNAMESE  19
+```
+
+### API Reference
+
+- `dict_lookup_word(const uint8_t *seq, char *word_out, size_t word_out_len)`
+  - Searches `Dictionary.dat`, then `NewWords.dat`
+- `dict_add_unknown_word(const uint8_t *seq)`
+  - Appends unknown sequences into `NewWords.dat`
+- `dict_merge_new_words(void)`
+  - Appends `NewWords.dat` into `Dictionary.dat`, then deletes `NewWords.dat`
+- `create_language_file(void)`
+  - Creates `Language.dat` if missing, without overwriting existing data
+
+### Usage Examples
+
+Generate initial dictionary files:
+
+```bash
+python3 generate_dicts.py /path/to/microsd
+```
+
+Expected outputs:
+
+- `/path/to/microsd/Language.dat` (640 bytes)
+- `/path/to/microsd/Dictionary.dat` (empty template)
+
+### Constants
+
+```c
+#define DICT_RECORD_SIZE 42
+#define LANG_RECORD_SIZE 32
+#define DICT_LANG_ID_SIZE 2
+#define DICT_PHONEME_SIZE 15
+#define DICT_WORD_SIZE 25
+#define LANG_ID_SIZE 2
+#define LANG_NAME_SIZE 30
+```
+
+### Performance Notes
+
+- Dictionary lookup: O(n) with early-exit optimization on sorted data
+- NewWords lookup: O(m), where m is unknown-word count
+- Unknown append: O(1)
+- Merge operation: O(k), where k is merge record count
+
+### File Size Summary
+
+| File                        | Count | Size   | Bytes/Entry |
+|-----------------------------|-------|--------|-------------|
+| Language.dat                | 20    | 640 B  | 32          |
+| Dictionary.dat (1000 words) | 1000  | 42 KB  | 42          |
+| NewWords.dat (100 words)    | 100   | 4.2 KB | 42          |
+| **Total**                   | 1120  | ~47 KB | -           |
+
+### Testing Checklist
+
+- [ ] Language.dat created with 20 entries (640 bytes)
+- [ ] Dictionary.dat created (initially empty)
+- [ ] Unknown word added to NewWords.dat
+- [ ] Output includes `[NEW]` tag for unknown words
+- [ ] Same unknown sequence recognized on second occurrence
+- [ ] `dict_merge_new_words()` merges entries successfully
+- [ ] NewWords.dat removed after merge
+
+### Troubleshooting
+
+| Problem              | Cause              | Solution                 |
+|----------------------|--------------------|--------------------------|
+| No Language.dat      | SD not ready       | Check SD mount status    |
+| NewWords not created | SD write failed    | Verify write permissions |
+| Words not found      | Phoneme mismatch   | Check phoneme sequence   |
+| Merge fails          | Append error       | Free up SD space         |
+| Performance slow     | NewWords too large | Run merge operation      |

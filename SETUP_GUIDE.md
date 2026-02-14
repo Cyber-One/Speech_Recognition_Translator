@@ -174,7 +174,7 @@ add_record('Dictionary.dat', 1, b'\x05\x10\x15\x21\x00\x00\x00\x00\x00\x00\x00\x
 ## Support Files
 
 - **generate_dicts.py** - Python utility for generating Language.dat and Dictionary.dat
-- **MULTILINGUAL_SUPPORT.md** - Comprehensive documentation
+- **README.md** - Comprehensive project and multilingual documentation
 - **speech_recognition_translator.c** - Source code with API functions
 
 ## Ready for Deployment
