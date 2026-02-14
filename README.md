@@ -10,6 +10,30 @@ This stage aggregates phoneme outputs from **five** Speech_Process_8bit_relu uni
 - **Output mode** selectable via 2 GPIO pins (USB / TTL / I2C)
 - **Diagnostic GPIOs** indicate stage‑2 device failure
 
+## Table of Contents
+
+- [Pin Configuration](#pin-configuration)
+- [Stage‑2 FIFO Read Protocol](#stage2-fifo-read-protocol)
+- [Phoneme Buffering](#phoneme-buffering)
+- [Dictionary Storage (microSD)](#dictionary-storage-microsd)
+- [Translation Output](#translation-output)
+- [microSD Capacity](#microsd-capacity)
+- [Command Set (Stage‑2 Control)](#command-set-stage2-control)
+- [Build](#build)
+- [Status](#status)
+- [Multilingual Support & Unknown Word Tracking](#multilingual-support--unknown-word-tracking)
+  - [Two-File Architecture](#two-file-architecture)
+  - [Unknown Word Lifecycle](#unknown-word-lifecycle)
+  - [File Specifications](#file-specifications)
+  - [Language IDs](#language-ids)
+  - [API Reference](#api-reference)
+  - [Usage Examples](#usage-examples)
+  - [Constants](#constants)
+  - [Performance Notes](#performance-notes)
+  - [File Size Summary](#file-size-summary)
+  - [Testing Checklist](#testing-checklist)
+  - [Troubleshooting](#troubleshooting)
+
 ## Pin Configuration
 
 ### I2C0 (Stage‑2 Read)
