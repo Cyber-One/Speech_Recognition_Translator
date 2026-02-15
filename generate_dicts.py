@@ -1,31 +1,24 @@
 #!/usr/bin/env python3
-"""
-Generate Dictionary.dat and Language.dat files for Speech Recognition Translator.
+"""Generate Language.dat and editable fixed-width Dictionary.dat files.
 
-This script creates the microSD card data files needed by the system:
-- Language.dat: Mapping of language IDs to language names
-- Dictionary.dat: Sorted phoneme sequence to word mappings
+Dictionary.dat text record format (fixed width):
+    15 two-digit hex values plus trailing spaces (45 chars)
+    + word field padded with spaces to 26 chars
+    + CRLF
 
-File Formats:
-- Language.dat: 32 bytes per record (2-byte ID + 30-byte name)
-- Dictionary.dat: 42 bytes per record (2-byte lang ID + 15-byte phoneme seq + 25-byte word)
+Record length = 73 bytes, which keeps binary-search indexing simple.
 """
 
-import struct
 import sys
 import os
 
 # Record sizes
-LANG_RECORD_SIZE = 32
-DICT_RECORD_SIZE = 42
+DICT_HEX_COUNT = 15
+DICT_HEX_FIELD_CHARS = 45
+DICT_WORD_SIZE = 26
+DICT_RECORD_SIZE = DICT_HEX_FIELD_CHARS + DICT_WORD_SIZE + 2
 
-# Field sizes
-LANG_ID_SIZE = 2
-LANG_NAME_SIZE = 30
-
-DICT_LANG_ID_SIZE = 2
 DICT_PHONEME_SIZE = 15
-DICT_WORD_SIZE = 25
 
 # Language definitions
 LANGUAGES = [
@@ -56,18 +49,9 @@ def create_language_dat(output_path):
     """Create Language.dat with language ID mappings."""
     print(f"Creating {output_path}...")
     
-    with open(output_path, 'wb') as f:
+    with open(output_path, 'w', newline='') as f:
         for lang_id, lang_name in LANGUAGES:
-            record = bytearray(LANG_RECORD_SIZE)
-            
-            # Write language ID (little-endian, 2 bytes)
-            struct.pack_into('<H', record, 0, lang_id)
-            
-            # Write language name (null-padded)
-            name_bytes = lang_name.encode('ascii')[:LANG_NAME_SIZE-1]
-            record[LANG_ID_SIZE:LANG_ID_SIZE + len(name_bytes)] = name_bytes
-            
-            f.write(record)
+            f.write(f"{lang_id:02X} {lang_name}\r\n")
             print(f"  {lang_id:3d}: {lang_name}")
     
     print(f"✓ Created {output_path} ({len(LANGUAGES)} languages)")
@@ -76,43 +60,33 @@ def create_language_dat(output_path):
 
 def create_dictionary_dat(input_file, output_path, language_id=1):
     """
-    Create Dictionary.dat from a word list file.
-    
-    Input file format: One word per line, or "phoneme_seq word" format
-    Assumes phoneme sequences are converted to 15-byte sequences.
-    
-    For now, creates an empty template that can be populated with real data.
+    Create Dictionary.dat as an empty fixed-width text file.
     """
     print(f"Creating {output_path}...")
-    
-    # For initial generation, create an empty/template dictionary
-    # Users should populate this with their own word/phoneme data
-    
-    with open(output_path, 'wb') as f:
-        # Write a template record as an example
-        record = bytearray(DICT_RECORD_SIZE)
-        
-        # Language ID (little-endian)
-        struct.pack_into('<H', record, 0, language_id)
-        
-        # Phoneme sequence (15 bytes, all zeros for template)
-        # In real usage, these would be phoneme IDs (0x05-0x2C)
-        
-        # Word (25 bytes, null-padded)
-        word = "TEMPLATE"
-        word_bytes = word.encode('ascii')[:DICT_WORD_SIZE-1]
-        record[DICT_LANG_ID_SIZE + DICT_PHONEME_SIZE:
-               DICT_LANG_ID_SIZE + DICT_PHONEME_SIZE + len(word_bytes)] = word_bytes
-        
-        # Note: Don't write the template, start with empty file
-        # Users will populate via external tools or import
     
     # Create empty file
     open(output_path, 'wb').close()
     print(f"✓ Created empty {output_path} (ready for population)")
-    print(f"  Record format: 2-byte language ID + 15-byte phoneme sequence + 25-byte word")
+    print(f"  Record format: 15 hex bytes + 26-char word + CRLF")
     print(f"  Each record: {DICT_RECORD_SIZE} bytes")
     return True
+
+
+def format_dict_record(phoneme_seq, word):
+    """Build one fixed-width Dictionary.dat record (as bytes)."""
+    if len(phoneme_seq) != DICT_PHONEME_SIZE:
+        raise ValueError(f"Phoneme sequence must be {DICT_PHONEME_SIZE} bytes")
+
+    if len(word) > DICT_WORD_SIZE:
+        raise ValueError(f"Word too long (max {DICT_WORD_SIZE} chars)")
+
+    hex_part = ''.join(f"{b:02X} " for b in phoneme_seq)  # 45 chars with trailing space
+    if len(hex_part) != DICT_HEX_FIELD_CHARS:
+        raise ValueError("Internal format error: bad hex field length")
+
+    word_part = word.ljust(DICT_WORD_SIZE, ' ')
+    line = f"{hex_part}{word_part}\r\n"
+    return line.encode('ascii')
 
 
 def add_dictionary_entry(output_path, phoneme_seq, word, language_id=1):
@@ -128,22 +102,9 @@ def add_dictionary_entry(output_path, phoneme_seq, word, language_id=1):
     if len(phoneme_seq) != DICT_PHONEME_SIZE:
         raise ValueError(f"Phoneme sequence must be {DICT_PHONEME_SIZE} bytes")
     
-    if len(word) > DICT_WORD_SIZE - 1:
-        raise ValueError(f"Word too long (max {DICT_WORD_SIZE-1} chars)")
-    
-    record = bytearray(DICT_RECORD_SIZE)
-    
-    # Language ID
-    struct.pack_into('<H', record, 0, language_id)
-    
-    # Phoneme sequence
-    record[DICT_LANG_ID_SIZE:DICT_LANG_ID_SIZE + DICT_PHONEME_SIZE] = bytes(phoneme_seq)
-    
-    # Word
-    word_bytes = word.encode('ascii')
-    record[DICT_LANG_ID_SIZE + DICT_PHONEME_SIZE:
-           DICT_LANG_ID_SIZE + DICT_PHONEME_SIZE + len(word_bytes)] = word_bytes
-    
+    _ = language_id  # kept for call compatibility; format no longer stores language ID
+    record = format_dict_record(phoneme_seq, word)
+
     with open(output_path, 'ab') as f:
         f.write(record)
 
@@ -160,20 +121,14 @@ def print_dictionary_entry(data):
     """Print a dictionary entry in human-readable format."""
     if len(data) != DICT_RECORD_SIZE:
         return None
-    
-    # Extract fields
-    lang_id = struct.unpack_from('<H', data, 0)[0]
-    phoneme_seq = data[DICT_LANG_ID_SIZE:DICT_LANG_ID_SIZE + DICT_PHONEME_SIZE]
-    word_bytes = data[DICT_LANG_ID_SIZE + DICT_PHONEME_SIZE:
-                       DICT_LANG_ID_SIZE + DICT_PHONEME_SIZE + DICT_WORD_SIZE]
-    
-    # Extract null-terminated string
-    word = word_bytes.split(b'\0')[0].decode('ascii', errors='ignore')
+    line = data.decode('ascii', errors='ignore')
+
+    hex_part = line[:DICT_HEX_FIELD_CHARS]
+    word = line[DICT_HEX_FIELD_CHARS:DICT_HEX_FIELD_CHARS + DICT_WORD_SIZE].rstrip(' ')
+    phoneme_seq = hex_part.strip().split(' ')
     
     return {
-        'lang_id': lang_id,
-        'lang_name': get_language_name(lang_id),
-        'phoneme_seq': ' '.join(f'0x{b:02X}' for b in phoneme_seq),
+        'phoneme_seq': ' '.join(phoneme_seq),
         'word': word
     }
 
@@ -222,13 +177,15 @@ def main():
     print("  4. Use dict_merge_new_words() to merge unknown words back into Dictionary.dat")
     print("")
     print("Record format reference:")
-    print(f"  Language.dat: {LANG_RECORD_SIZE} bytes per record")
-    print(f"    - 2 bytes: Language ID (little-endian)")
-    print(f"    - 30 bytes: Language name (null-padded)")
+    print(f"  Language.dat: text records")
+    print(f"    - 2 hex chars: Language ID (00-FF)")
+    print(f"    - 1 char: Space separator")
+    print(f"    - N chars: Language name")
+    print(f"    - 2 chars: CRLF")
     print(f"  Dictionary.dat: {DICT_RECORD_SIZE} bytes per record")
-    print(f"    - 2 bytes: Language ID (little-endian)")
-    print(f"    - 15 bytes: Phoneme sequence (phoneme IDs)")
-    print(f"    - 25 bytes: Word (null-padded)")
+    print(f"    - 45 chars: 15 hex phoneme IDs (00-FF) separated by spaces")
+    print(f"    - 26 chars: Word (space padded)")
+    print(f"    - 2 chars: CRLF")
 
 
 if __name__ == '__main__':

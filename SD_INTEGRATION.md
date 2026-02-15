@@ -36,8 +36,11 @@ The Speech Recognition Translator now integrates full microSD card support via *
 
 ```txt
 /microsd/
-  ├── PhonemeList.txt      (44 lines: ID → Sphinx name → IPA)
-  ├── Dictionary.dat       (~5.3 MB binary: phoneme sequences → words)
+   ├── Language.dat         (text: HH + language name)
+   ├── Dictionary.dat       (fixed-width text: phoneme sequences → words)
+   ├── UserList.txt         (user ID to name mapping)
+   ├── PhonemeList.txt      (44 lines: ID → Sphinx name → IPA)
+   ├── NewWords.dat         (runtime-created unknown words)
   └── (reserved for future features)
 ```
 
@@ -93,16 +96,17 @@ bool dict_lookup_word(const uint8_t *seq, char *word_out, size_t word_out_len)
 
 1. **Mount:** FatFs mounts SD card on first call (`f_mount(&fs, "0:", 1)`)
 2. **Open:** Opens `0:/microsd/Dictionary.dat` in read-only mode
-3. **Search:** Linear scan through 40-byte records (15 phonemes + 25-char word)
+3. **Search:** Binary search through fixed-size text records in `Dictionary.dat`
 4. **Match:** Compares phoneme sequence against sorted records
 5. **Extract:** Copies ASCII word to output buffer on match
 6. **Return:** `true` on success, `false` if not found
 
-**Record Format (40 bytes):**
+**Record Format (73 bytes):**
 
 ```txt
-Bytes 0-14:   Phoneme IDs (15 × uint8_t, e.g., [0x05, 0x06, 0x00, ...])
-Bytes 15-39:  ASCII word (25 bytes, null-padded)
+Chars 0-44:   15 two-digit hex phoneme IDs separated by spaces (trailing space included)
+Chars 45-70:  ASCII word (26 chars, space padded)
+Chars 71-72:  CRLF
 ```
 
 **Example Lookup:**
@@ -117,10 +121,10 @@ if (dict_lookup_word(seq, word, sizeof(word))) {
 
 ### Performance Characteristics
 
-- **Linear search:** O(n) per lookup, where n = ~67,000 records
-- **Typical latency:** 100–500 ms per dictionary lookup (depends on match position)
+- **Binary search:** O(log n) per lookup on sorted Dictionary.dat
+- **Typical latency:** card-dependent; generally much lower than full linear scans
 - **Cache opportunity:** Most phoneme sequences repeat; caching could reduce latency
-- **Optimization:** Binary search possible due to sorted dictionary (not yet implemented)
+- **Optimization status:** Binary search is implemented for the primary dictionary
 
 ## Integration with Main Pipeline
 
@@ -159,7 +163,9 @@ Output: word + gender + confidence
 
 - [ ] microSD card formatted as FAT32 or exFAT
 - [ ] `/microsd/` directory created on card
-- [ ] `Dictionary.dat` copied to `/microsd/` (~5.3 MB)
+- [ ] `Language.dat` copied to `/microsd/` (text format: `HH LanguageName`)
+- [ ] `Dictionary.dat` copied to `/microsd/` (73-byte fixed-width text records)
+- [ ] `UserList.txt` copied to `/microsd/` (user ID to name mapping)
 - [ ] `PhonemeList.txt` copied to `/microsd/` (reference only, ~1 KB)
 - [ ] SD card inserted into Pico breakout board
 - [ ] SPI0 wiring verified (pins 16–19, 17)
@@ -222,11 +228,7 @@ third_party/fatfs/source/
 
 ### Binary Search Optimization
 
-Currently, `dict_lookup_word()` uses linear search. A binary search implementation would:
-
-- Reduce average lookup time from 250 ms to ~10 ms
-- Require pre-sorting Dictionary.dat by phoneme sequence (already done)
-- Add complexity for edge case handling (phoneme prefix matching)
+`dict_lookup_word()` already uses binary search on sorted `Dictionary.dat`. Additional optimization ideas are now focused on caching and SD I/O behavior.
 
 ### Caching Layer
 

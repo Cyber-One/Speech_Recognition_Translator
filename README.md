@@ -13,6 +13,7 @@ This stage aggregates phoneme outputs from **five** Speech_Process_8bit_relu uni
 ## Table of Contents
 
 - [Pin Configuration](#pin-configuration)
+- [LCD Menu System (20x4)](#lcd-menu-system-20x4)
 - [Stage‑2 FIFO Read Protocol](#stage2-fifo-read-protocol)
 - [Phoneme Buffering](#phoneme-buffering)
 - [Dictionary Storage (microSD)](#dictionary-storage-microsd)
@@ -92,6 +93,65 @@ Mode table:
 | 16   | MISO     | SPI0 MISO      |
 | 17   | CS       | SD Chip Select |
 
+### LCD + Keypad (shared I2C expanders)
+
+Both the LCD and keypad use PCF8574 I/O expanders on the same I2C0 bus.
+
+| Device | I2C Address | Purpose |
+|--------|-------------|---------|
+| LCD backpack (PCF8574) | `0x27` | 20x4 text display |
+| Keypad expander (PCF8574) | `0x26` | 4x4 matrix keypad scan |
+
+Beginner wiring notes:
+
+- Keep all grounds common: Pico GND, stage-2 boards, LCD module, keypad module, SD module.
+- Use 3.3 V compatible I2C devices.
+- Ensure SDA/SCL have pull-ups (many modules include them already).
+- Avoid address conflicts on I2C0 (`0x26`, `0x27`, `0x60`-`0x64`).
+
+## LCD Menu System (20x4)
+
+### Default Screen (Screen 0)
+
+- **Line 0:** System status + microSD error status
+- **Lines 1-3:** Wrapped history containing the last **10** recognized words
+
+Press **`#`** from Screen 0 to open the menu.
+
+### Key Mapping (Menu/Input)
+
+- **A** = Up
+- **B** = Down
+- **C** = Left
+- **D** = Right
+
+### Main Menu (Paged)
+
+- **Line 0:** `Main Menu Pg 0` or `Main Menu Pg 1`
+- **Page 0:**
+  1. **Add New User**
+  2. **User Menu**
+- **Page 1:**
+  3. **Start Training**
+  4. **Select Word from Unrecognized List**
+  5. **Initiate Speech Generator Training**
+
+Navigation behavior:
+
+- From **Page 0**, **A/C/D** have no effect.
+- From **Page 0**, **B** switches to **Page 1**.
+- From **Page 1**, **A** switches back to **Page 0**.
+- Press **`*`** to exit menu screens back to Screen 0.
+
+### User Menu (from Main Menu option 2)
+
+- **Line 0:** `User Menu`
+- **Line 1:** `User ID: <id> <name>` for the current selection
+- **A/B** cycles up/down through configured users
+- Only assigned users are shown (unassigned/default entries are excluded)
+- Press **`#`** to select the displayed user and return to Screen 0
+- Press **`*`** to return to Main Menu
+
 ## Stage‑2 FIFO Read Protocol
 
 The Translator reads each stage‑2 device via I2C0 (master):
@@ -156,15 +216,22 @@ ninja
 
 ## Status
 
-This module currently provides the **hardware interface** and **FIFO ingest** scaffolding. Dictionary parsing, SD card I/O, and upstream I2C output are stubbed for implementation.
+This module provides a working stage-3 translator pipeline with:
+
+- Stage-2 FIFO reads over I2C
+- 15-phoneme sequence buffering and silence-triggered lookup
+- microSD FatFs dictionary storage
+- Unknown-word capture (`NewWords.dat`)
+- 20x4 LCD + keypad menu flow
+- User profile selection via `UserList.txt`
 
 ## Multilingual Support & Unknown Word Tracking
 
 The translator supports multiple languages through a language-ID system and tracks unrecognized phoneme sequences using a two-file dictionary design:
 
-- **Dictionary.dat**: Main sorted dictionary (42 bytes/record)
-- **NewWords.dat**: Sequential unknown-word file (42 bytes/record)
-- **Language.dat**: Language ID ↔ name mapping (32 bytes/record, 20 entries)
+- **Dictionary.dat**: Main sorted dictionary (73 bytes/record, fixed-width text)
+- **NewWords.dat**: Sequential unknown-word file (73 bytes/record, fixed-width text)
+- **Language.dat**: Language ID ↔ name mapping (text records, 20 entries)
 
 ### Two-File Architecture
 
@@ -194,33 +261,36 @@ dict_add_unknown_word(seq)
     └─ Append to NewWords.dat
 ```
 
+Note: the label text in files uses British spelling (`UnRecognisedXX`), while UI text may use `Unrecognized`.
+
 ### File Specifications
 
 #### Language.dat
 
 - **Purpose**: Language ID mapping
-- **Format**: 32 bytes/record
-  - Bytes 0-1: Language ID (little-endian uint16)
-  - Bytes 2-31: Language name (null-terminated, null-padded ASCII)
+- **Format**: Text records (`HH LanguageName\r\n`)
+  - Chars 0-1: Language ID (2-digit hex)
+  - Char 2: Space separator
+  - Chars 3..N: Language name
+  - Line ending: CRLF
 - **Entries**: 20 predefined languages
-- **Size**: 640 bytes
+- **Size**: Variable (~235 bytes for 20 default entries)
 - **Location**: `/microsd/Language.dat`
 
 #### Dictionary.dat
 
 - **Purpose**: Primary sorted lookup table
-- **Format**: 42 bytes/record
-  - Bytes 0-1: Language ID
-  - Bytes 2-16: Phoneme sequence (15 bytes)
-  - Bytes 17-41: Word (25 bytes, null-padded)
+- **Format**: 73 bytes/record (fixed-width text)
+  - Chars 0-44: 15 two-digit hex phoneme IDs separated by spaces (includes trailing space)
+  - Chars 45-70: Word field (26 chars, space padded)
+  - Chars 71-72: CRLF
 - **Sort Order**: Lexicographic by phoneme sequence
 - **Location**: `/microsd/Dictionary.dat`
 
 #### NewWords.dat
 
 - **Purpose**: Unknown-word accumulation during runtime
-- **Format**: 42 bytes/record (same as Dictionary.dat)
-- **Language ID**: Always 0 (unknown)
+- **Format**: 73 bytes/record (same as Dictionary.dat)
 - **Word Label**: `UnRecognised00` ... `UnRecognised99`
 - **Location**: `/microsd/NewWords.dat`
 
@@ -270,24 +340,20 @@ python3 generate_dicts.py /path/to/microsd
 
 Expected outputs:
 
-- `/path/to/microsd/Language.dat` (640 bytes)
+- `/path/to/microsd/Language.dat` (text format, ~235 bytes with defaults)
 - `/path/to/microsd/Dictionary.dat` (empty template)
 
 ### Constants
 
 ```c
-#define DICT_RECORD_SIZE 42
-#define LANG_RECORD_SIZE 32
-#define DICT_LANG_ID_SIZE 2
-#define DICT_PHONEME_SIZE 15
-#define DICT_WORD_SIZE 25
-#define LANG_ID_SIZE 2
-#define LANG_NAME_SIZE 30
+#define DICT_HEX_FIELD_CHARS 45
+#define DICT_WORD_SIZE 26
+#define DICT_RECORD_SIZE 73
 ```
 
 ### Performance Notes
 
-- Dictionary lookup: O(n) with early-exit optimization on sorted data
+- Dictionary lookup: O(log n) binary search on sorted `Dictionary.dat`
 - NewWords lookup: O(m), where m is unknown-word count
 - Unknown append: O(1)
 - Merge operation: O(k), where k is merge record count
@@ -296,14 +362,14 @@ Expected outputs:
 
 | File                        | Count | Size   | Bytes/Entry |
 |-----------------------------|-------|--------|-------------|
-| Language.dat                | 20    | 640 B  | 32          |
-| Dictionary.dat (1000 words) | 1000  | 42 KB  | 42          |
-| NewWords.dat (100 words)    | 100   | 4.2 KB | 42          |
-| **Total**                   | 1120  | ~47 KB | -           |
+| Language.dat                | 20    | ~235 B | variable    |
+| Dictionary.dat (1000 words) | 1000  | 73 KB  | 73          |
+| NewWords.dat (100 words)    | 100   | 7.3 KB | 73          |
+| **Total**                   | 1120  | ~80 KB | -           |
 
 ### Testing Checklist
 
-- [ ] Language.dat created with 20 entries (640 bytes)
+- [ ] Language.dat created with 20 entries (text format)
 - [ ] Dictionary.dat created (initially empty)
 - [ ] Unknown word added to NewWords.dat
 - [ ] Output includes `[NEW]` tag for unknown words

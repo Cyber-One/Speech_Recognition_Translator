@@ -2,6 +2,7 @@
 #include <string.h>
 #include <ctype.h>
 #include <stdlib.h>
+#include <stdarg.h>
 #include "pico/stdlib.h"
 #include "hardware/i2c.h"
 #include "hardware/spi.h"
@@ -71,25 +72,53 @@ static const char keypad_map[4][4] = {
 };
 
 typedef enum {
-    MENU_HOME = 0,
+    MENU_SCREEN0 = 0,
+    MENU_MAIN,
     MENU_SELECT_USER,
     MENU_NEW_USER,
     MENU_TRAIN_CAPTURE,
-    MENU_BACKPROP
+    MENU_SELECT_UNREC,
+    MENU_SPEECH_GEN_TRAIN
 } menu_state_t;
 
-static menu_state_t menu_state = MENU_HOME;
+static menu_state_t menu_state = MENU_SCREEN0;
 static char input_buffer_line[32];
 static uint8_t input_len = 0;
-static uint8_t new_user_step = 0;
-static char pending_full_name[64];
-static char pending_gender[8];
-static uint8_t pending_age = 0;
+static uint8_t menu_main_page = 0;
 
-// LCD recent words (channel 2)
-#define RECENT_WORDS 4
-static char recent_lines[RECENT_WORDS][21];
-static uint8_t recent_count = 0;
+#define ADD_USER_NAME_MAX 14
+#define USER_MENU_MAX 20
+#define WORD_TEXT_MAX 27
+
+typedef enum {
+    ADD_USER_STEP_NAME = 0,
+    ADD_USER_STEP_GENDER,
+    ADD_USER_STEP_LANGUAGE
+} add_user_step_t;
+
+static add_user_step_t add_user_step = ADD_USER_STEP_NAME;
+static uint8_t add_user_id = 1;
+static char add_user_name[ADD_USER_NAME_MAX + 1] = "A";
+static uint8_t add_user_name_len = 1;
+static uint8_t add_user_cursor = 0;
+static bool add_user_gender_male = true;
+static uint8_t add_user_lang_index = 1;
+static char add_user_language[31] = "English";
+
+static uint8_t user_menu_ids[USER_MENU_MAX] = {0};
+static char user_menu_names[USER_MENU_MAX][26];
+static uint8_t user_menu_count = 0;
+static uint8_t user_menu_index = 0;
+
+// LCD history/state
+#define WORD_HISTORY_COUNT 10
+static char word_history[WORD_HISTORY_COUNT][WORD_TEXT_MAX];
+static uint8_t word_history_count = 0;
+static char lcd_status_line[21] = "Status: Booting";
+
+#define UNREC_PREVIEW_COUNT 3
+static char unrec_preview[UNREC_PREVIEW_COUNT][WORD_TEXT_MAX];
+static uint8_t unrec_preview_count = 0;
 
 // Silence IDs
 #define SIL_WORD_ID 0x02
@@ -147,13 +176,16 @@ typedef struct {
 
 #define PHONEME_SEQ_LEN 15
 
-// Dictionary format: 2-byte language ID + 15-byte phoneme seq + 25-byte word
-#define DICT_RECORD_SIZE 42
-#define DICT_LANG_ID_SIZE 2
-#define DICT_PHONEME_SIZE 15
-#define DICT_WORD_SIZE 25
+// Dictionary text format (fixed width, binary-search friendly):
+// 15 hex bytes with trailing spaces (45 chars) + 26-char word field + CRLF (2 chars)
+// Example:
+// "05 10 15 21 00 00 00 00 00 00 00 00 00 00 00 hello                     \r\n"
+#define DICT_HEX_FIELD_CHARS 45
+#define DICT_WORD_SIZE 26
+#define DICT_LINE_END_CHARS 2
+#define DICT_RECORD_SIZE (DICT_HEX_FIELD_CHARS + DICT_WORD_SIZE + DICT_LINE_END_CHARS)
 
-// Language file format: 2-byte ID + 30-byte name
+// Language file format: "HH Name\r\n" (2-digit hex ID, space, text name)
 #define LANG_RECORD_SIZE 32
 #define LANG_ID_SIZE 2
 #define LANG_NAME_SIZE 30
@@ -204,6 +236,7 @@ typedef struct {
     char full_name[64];
     uint8_t age;
     char gender[8];
+    char language[31];
     bool set;
 } user_profile_t;
 
@@ -311,31 +344,85 @@ static void lcd_init(void) {
 }
 
 static bool lcd_available_for_status(void) {
-    return (train_state == TRAIN_IDLE) && (menu_state == MENU_HOME);
+    return (train_state == TRAIN_IDLE) && (menu_state == MENU_SCREEN0);
 }
 
-static void lcd_update_recent(void) {
-    if (!lcd_available_for_status()) return;
-    lcd_clear();
-    for (uint8_t i = 0; i < RECENT_WORDS; i++) {
-        lcd_set_cursor(0, i);
-        lcd_print(recent_lines[i]);
-    }
-}
-
-static void recent_words_push(const char *word, const char *gender) {
+static void lcd_print_padded_line(uint8_t row, const char *text) {
     char line[21];
-    snprintf(line, sizeof(line), "%s %s", word, gender);
-
-    for (int i = RECENT_WORDS - 1; i > 0; i--) {
-        strncpy(recent_lines[i], recent_lines[i - 1], sizeof(recent_lines[i]));
-        recent_lines[i][20] = '\0';
+    memset(line, ' ', 20);
+    line[20] = '\0';
+    if (text) {
+        strncpy(line, text, 20);
     }
-    strncpy(recent_lines[0], line, sizeof(recent_lines[0]) - 1);
-    recent_lines[0][20] = '\0';
+    lcd_set_cursor(0, row);
+    lcd_print(line);
+}
 
-    if (recent_count < RECENT_WORDS) recent_count++;
-    lcd_update_recent();
+static void lcd_set_status(const char *fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(lcd_status_line, sizeof(lcd_status_line), fmt, args);
+    va_end(args);
+
+    lcd_status_line[20] = '\0';
+}
+
+static void lcd_render_screen0(void) {
+    if (!lcd_available_for_status()) return;
+
+    lcd_clear();
+    lcd_print_padded_line(0, lcd_status_line);
+
+    char history_text[256] = {0};
+    size_t cursor = 0;
+
+    int start = (word_history_count > WORD_HISTORY_COUNT) ? (word_history_count - WORD_HISTORY_COUNT) : 0;
+    for (int i = start; i < word_history_count; i++) {
+        const char *word = word_history[i % WORD_HISTORY_COUNT];
+        if (word[0] == '\0') continue;
+
+        if (cursor > 0 && cursor + 1 < sizeof(history_text) - 1) {
+            history_text[cursor++] = ' ';
+        }
+
+        size_t wlen = strnlen(word, DICT_WORD_SIZE);
+        if (cursor + wlen >= sizeof(history_text) - 1) {
+            break;
+        }
+
+        memcpy(&history_text[cursor], word, wlen);
+        cursor += wlen;
+        history_text[cursor] = '\0';
+    }
+
+    for (uint8_t row = 1; row <= 3; row++) {
+        char line[21] = {0};
+        size_t offset = (size_t)(row - 1) * 20;
+        if (offset < strlen(history_text)) {
+            strncpy(line, &history_text[offset], 20);
+        }
+        lcd_print_padded_line(row, line);
+    }
+}
+
+static void word_history_push(const char *word) {
+    if (!word || word[0] == '\0') return;
+
+    if (word_history_count < WORD_HISTORY_COUNT) {
+        strncpy(word_history[word_history_count], word, sizeof(word_history[word_history_count]) - 1);
+        word_history[word_history_count][sizeof(word_history[word_history_count]) - 1] = '\0';
+        word_history_count++;
+    } else {
+        for (int i = 0; i < WORD_HISTORY_COUNT - 1; i++) {
+            strncpy(word_history[i], word_history[i + 1], sizeof(word_history[i]) - 1);
+            word_history[i][sizeof(word_history[i]) - 1] = '\0';
+        }
+
+        strncpy(word_history[WORD_HISTORY_COUNT - 1], word, sizeof(word_history[WORD_HISTORY_COUNT - 1]) - 1);
+        word_history[WORD_HISTORY_COUNT - 1][sizeof(word_history[WORD_HISTORY_COUNT - 1]) - 1] = '\0';
+    }
+
+    lcd_render_screen0();
 }
 
 static int strcasecmp_local(const char *a, const char *b) {
@@ -380,16 +467,375 @@ static char keypad_get_key(void) {
     return 0;
 }
 
-static void menu_render_home(void) {
+static void menu_render_screen0(void) {
+    lcd_render_screen0();
+}
+
+static void menu_render_main(void) {
     lcd_clear();
-    lcd_set_cursor(0, 0);
-    lcd_print("A:Select User");
-    lcd_set_cursor(0, 1);
-    lcd_print("B:New User");
-    lcd_set_cursor(0, 2);
-    lcd_print("C:Capture");
-    lcd_set_cursor(0, 3);
-    lcd_print("D:Backprop");
+    char title[21];
+    snprintf(title, sizeof(title), "Main Menu Pg %u", (unsigned)menu_main_page);
+    lcd_print_padded_line(0, title);
+
+    if (menu_main_page == 0) {
+        lcd_print_padded_line(1, "1:Add New User");
+        lcd_print_padded_line(2, "2:Select User");
+        lcd_print_padded_line(3, "B:Pg1  *:Exit");
+    } else {
+        lcd_print_padded_line(1, "1:Add New User");
+        lcd_print_padded_line(2, "3:Train 4:Unrec");
+        lcd_print_padded_line(3, "5:SpeechGen A:Pg0");
+    }
+}
+
+static char add_user_next_char(char c) {
+    if (c < 'A' || c > 'Z') return 'A';
+    return (c == 'Z') ? 'A' : (char)(c + 1);
+}
+
+static char add_user_prev_char(char c) {
+    if (c < 'A' || c > 'Z') return 'A';
+    return (c == 'A') ? 'Z' : (char)(c - 1);
+}
+
+static int language_hex_nibble(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
+    if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
+    return -1;
+}
+
+static bool language_parse_line(const char *line, uint8_t *id_out, char *name_out, size_t name_out_len) {
+    if (!line || !id_out || !name_out || name_out_len < 2) return false;
+
+    if (!isxdigit((unsigned char)line[0]) || !isxdigit((unsigned char)line[1]) || line[2] != ' ') {
+        return false;
+    }
+
+    int hi = language_hex_nibble(line[0]);
+    int lo = language_hex_nibble(line[1]);
+    if (hi < 0 || lo < 0) return false;
+
+    *id_out = (uint8_t)((hi << 4) | lo);
+
+    const char *name = &line[3];
+    while (*name == ' ') name++;
+
+    strncpy(name_out, name, name_out_len - 1);
+    name_out[name_out_len - 1] = '\0';
+
+    char *eol = strpbrk(name_out, "\r\n");
+    if (eol) *eol = '\0';
+
+    size_t nlen = strlen(name_out);
+    while (nlen > 0 && name_out[nlen - 1] == ' ') {
+        name_out[nlen - 1] = '\0';
+        nlen--;
+    }
+
+    return name_out[0] != '\0';
+}
+
+static bool language_name_from_index(uint8_t index, char *name_out, size_t name_out_len) {
+    if (!name_out || name_out_len < 2) return false;
+
+    FIL lang_file;
+    if (f_open(&lang_file, "0:/microsd/Language.dat", FA_READ | FA_OPEN_EXISTING) != FR_OK) {
+        strncpy(name_out, "English", name_out_len - 1);
+        name_out[name_out_len - 1] = '\0';
+        return false;
+    }
+
+    char line[96];
+    bool found = false;
+    while (f_gets(line, sizeof(line), &lang_file)) {
+        uint8_t parsed_id = 0;
+        char parsed_name[LANG_NAME_SIZE + 1] = {0};
+        if (!language_parse_line(line, &parsed_id, parsed_name, sizeof(parsed_name))) continue;
+        if (parsed_id != index) continue;
+
+        strncpy(name_out, parsed_name, name_out_len - 1);
+        name_out[name_out_len - 1] = '\0';
+        found = true;
+        break;
+    }
+
+    f_close(&lang_file);
+
+    if (!found) {
+        strncpy(name_out, "English", name_out_len - 1);
+        name_out[name_out_len - 1] = '\0';
+    }
+
+    return found;
+}
+
+static uint8_t language_record_count(void) {
+    FIL lang_file;
+    FRESULT res = f_open(&lang_file, "0:/microsd/Language.dat", FA_READ | FA_OPEN_EXISTING);
+    if (res != FR_OK) return 20;
+
+    uint32_t count = 0;
+    char line[96];
+    while (f_gets(line, sizeof(line), &lang_file)) {
+        uint8_t parsed_id = 0;
+        char parsed_name[LANG_NAME_SIZE + 1] = {0};
+        if (!language_parse_line(line, &parsed_id, parsed_name, sizeof(parsed_name))) continue;
+        count++;
+    }
+
+    f_close(&lang_file);
+
+    if (count == 0) return 20;
+    if (count > 255) return 255;
+    return (uint8_t)count;
+}
+
+static bool user_list_find_first_available(uint8_t *id_out) {
+    if (!id_out) return false;
+
+    bool present[USER_ID_MAX + 1] = {0};
+    char names[USER_ID_MAX + 1][32];
+    memset(names, 0, sizeof(names));
+
+    FIL user_file;
+    FRESULT res = f_open(&user_file, "0:/microsd/UserList.txt", FA_READ | FA_OPEN_EXISTING);
+    if (res != FR_OK) {
+        *id_out = 1;
+        return true;
+    }
+
+    char line[96];
+    while (f_gets(line, sizeof(line), &user_file)) {
+        if (line[0] == '#' || line[0] == '\r' || line[0] == '\n') continue;
+
+        char *comma = strchr(line, ',');
+        if (!comma) continue;
+        *comma = '\0';
+        int id = atoi(line);
+        if (id < 0 || id > USER_ID_MAX) continue;
+
+        char *name = comma + 1;
+        char *eol = strpbrk(name, "\r\n");
+        if (eol) *eol = '\0';
+
+        present[id] = true;
+        strncpy(names[id], name, sizeof(names[id]) - 1);
+        names[id][sizeof(names[id]) - 1] = '\0';
+    }
+    f_close(&user_file);
+
+    for (uint8_t id = 1; id <= USER_ID_MAX; id++) {
+        char default_name[16];
+        snprintf(default_name, sizeof(default_name), "User%02u", id);
+
+        if (!present[id] || names[id][0] == '\0' || strcmp(names[id], default_name) == 0) {
+            *id_out = id;
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static bool user_list_set_name(uint8_t user_id, const char *name) {
+    if (user_id == 0 || user_id > USER_ID_MAX || !name || name[0] == '\0') return false;
+
+    char names[USER_ID_MAX + 1][32];
+    memset(names, 0, sizeof(names));
+
+    FIL user_file;
+    FRESULT res = f_open(&user_file, "0:/microsd/UserList.txt", FA_READ | FA_OPEN_EXISTING);
+    if (res == FR_OK) {
+        char line[96];
+        while (f_gets(line, sizeof(line), &user_file)) {
+            if (line[0] == '#' || line[0] == '\r' || line[0] == '\n') continue;
+
+            char *comma = strchr(line, ',');
+            if (!comma) continue;
+            *comma = '\0';
+            int id = atoi(line);
+            if (id < 0 || id > USER_ID_MAX) continue;
+
+            char *old_name = comma + 1;
+            char *eol = strpbrk(old_name, "\r\n");
+            if (eol) *eol = '\0';
+
+            strncpy(names[id], old_name, sizeof(names[id]) - 1);
+            names[id][sizeof(names[id]) - 1] = '\0';
+        }
+        f_close(&user_file);
+    }
+
+    strncpy(names[user_id], name, sizeof(names[user_id]) - 1);
+    names[user_id][sizeof(names[user_id]) - 1] = '\0';
+
+    res = f_open(&user_file, "0:/microsd/UserList.txt", FA_WRITE | FA_CREATE_ALWAYS);
+    if (res != FR_OK) return false;
+
+    UINT bw;
+    const char *header = "# id,name\r\n0,Unknown\r\n";
+    if (f_write(&user_file, header, (UINT)strlen(header), &bw) != FR_OK) {
+        f_close(&user_file);
+        return false;
+    }
+
+    for (uint8_t id = 1; id <= USER_ID_MAX; id++) {
+        char line[64];
+        if (names[id][0] == '\0') {
+            snprintf(names[id], sizeof(names[id]), "User%02u", id);
+        }
+        int n = snprintf(line, sizeof(line), "%u,%s\r\n", id, names[id]);
+        if (f_write(&user_file, line, (UINT)n, &bw) != FR_OK || bw != (UINT)n) {
+            f_close(&user_file);
+            return false;
+        }
+    }
+
+    f_close(&user_file);
+    return true;
+}
+
+static bool user_name_is_assigned(uint8_t id, const char *name) {
+    if (id == 0 || id > USER_ID_MAX || !name || name[0] == '\0') return false;
+
+    char default_name[16];
+    snprintf(default_name, sizeof(default_name), "User%02u", id);
+    return strcmp(name, default_name) != 0;
+}
+
+static void user_menu_load_assigned(void) {
+    user_menu_count = 0;
+    user_menu_index = 0;
+
+    FIL user_file;
+    FRESULT res = f_open(&user_file, "0:/microsd/UserList.txt", FA_READ | FA_OPEN_EXISTING);
+    if (res != FR_OK) {
+        return;
+    }
+
+    char line[96];
+    while (f_gets(line, sizeof(line), &user_file)) {
+        if (line[0] == '#' || line[0] == '\r' || line[0] == '\n') continue;
+
+        char *comma = strchr(line, ',');
+        if (!comma) continue;
+        *comma = '\0';
+
+        int id = atoi(line);
+        if (id <= 0 || id > USER_ID_MAX) continue;
+
+        char *name = comma + 1;
+        char *eol = strpbrk(name, "\r\n");
+        if (eol) *eol = '\0';
+
+        if (!user_name_is_assigned((uint8_t)id, name)) continue;
+        if (user_menu_count >= USER_ID_MAX) break;
+
+        user_menu_ids[user_menu_count] = (uint8_t)id;
+        strncpy(user_menu_names[user_menu_count], name, sizeof(user_menu_names[user_menu_count]) - 1);
+        user_menu_names[user_menu_count][sizeof(user_menu_names[user_menu_count]) - 1] = '\0';
+        user_menu_count++;
+    }
+
+    f_close(&user_file);
+}
+
+static void menu_render_user_menu(void) {
+    lcd_clear();
+    lcd_print_padded_line(0, "User Menu");
+
+    if (user_menu_count == 0) {
+        lcd_print_padded_line(1, "User ID: none");
+        lcd_print_padded_line(2, "No assigned users");
+        lcd_print_padded_line(3, "*:Back");
+        return;
+    }
+
+    char line1[21];
+    snprintf(line1, sizeof(line1), "User ID: %u %s",
+             (unsigned)user_menu_ids[user_menu_index],
+             user_menu_names[user_menu_index]);
+    lcd_print_padded_line(1, line1);
+    lcd_print_padded_line(2, "A/B:Cycle");
+    lcd_print_padded_line(3, "#:Select  *:Back");
+}
+
+static void user_menu_start(void) {
+    user_menu_load_assigned();
+    menu_render_user_menu();
+}
+
+static void make_username_from_name(const char *name, uint8_t user_id, char *username_out, size_t username_len) {
+    if (!username_out || username_len < 4) return;
+
+    size_t out = 0;
+    for (size_t i = 0; name && name[i] != '\0' && out + 1 < username_len; i++) {
+        char ch = name[i];
+        if (isalnum((unsigned char)ch)) {
+            username_out[out++] = (char)tolower((unsigned char)ch);
+        } else if (ch == ' ' && out + 1 < username_len) {
+            username_out[out++] = '_';
+        }
+    }
+    username_out[out] = '\0';
+
+    if (out == 0) {
+        snprintf(username_out, username_len, "user%02u", user_id);
+    }
+}
+
+static void menu_render_add_user(void) {
+    lcd_clear();
+
+    char line0[21];
+    snprintf(line0, sizeof(line0), "Add New User ID %u", (unsigned)add_user_id);
+    lcd_print_padded_line(0, line0);
+
+    char line1[21];
+    snprintf(line1, sizeof(line1), "Name: %s", add_user_name);
+    lcd_print_padded_line(1, line1);
+
+    char line2[21];
+    snprintf(line2, sizeof(line2), "Gender: %s", add_user_gender_male ? "Male" : "Female");
+    lcd_print_padded_line(2, line2);
+
+    char line3[21];
+    snprintf(line3, sizeof(line3), "Language: %s", add_user_language);
+    lcd_print_padded_line(3, line3);
+}
+
+static void add_user_start(void) {
+    add_user_id = 1;
+    if (!user_list_find_first_available(&add_user_id)) {
+        add_user_id = USER_ID_MAX;
+    }
+
+    memset(add_user_name, 0, sizeof(add_user_name));
+    add_user_name[0] = 'A';
+    add_user_name[1] = '\0';
+    add_user_name_len = 1;
+    add_user_cursor = 0;
+    add_user_gender_male = true;
+    add_user_step = ADD_USER_STEP_NAME;
+    add_user_lang_index = LANG_ENGLISH;
+    language_name_from_index(add_user_lang_index, add_user_language, sizeof(add_user_language));
+    menu_render_add_user();
+}
+
+static void menu_render_unrec_select(void) {
+    lcd_clear();
+    lcd_print_padded_line(0, "Unrec: 1-3 sel");
+
+    for (uint8_t i = 0; i < 3; i++) {
+        char line[21];
+        if (i < unrec_preview_count) {
+            snprintf(line, sizeof(line), "%u:%s", (unsigned)(i + 1), unrec_preview[i]);
+        } else {
+            snprintf(line, sizeof(line), "%u:<empty>", (unsigned)(i + 1));
+        }
+        lcd_print_padded_line((uint8_t)(i + 1), line);
+    }
 }
 
 static void menu_render_input(const char *title) {
@@ -430,8 +876,6 @@ static bool create_language_file(void) {
         return false;
     }
     
-    // Language record format: 2-byte ID + 30-byte name (null-padded)
-    uint8_t record[LANG_RECORD_SIZE];
     UINT bw;
     
     // Define initial languages
@@ -462,17 +906,11 @@ static bool create_language_file(void) {
     };
     
     for (int i = 0; i < 20; i++) {
-        memset(record, 0, LANG_RECORD_SIZE);
-        
-        // Write language ID (little-endian)
-        record[0] = languages[i].id & 0xFF;
-        record[1] = (languages[i].id >> 8) & 0xFF;
-        
-        // Write language name (null-terminated, padded)
-        strncpy((char *)&record[LANG_ID_SIZE], languages[i].name, LANG_NAME_SIZE - 1);
-        
-        res = f_write(&lang_file, record, LANG_RECORD_SIZE, &bw);
-        if (res != FR_OK || bw != LANG_RECORD_SIZE) {
+        char line[64];
+        int n = snprintf(line, sizeof(line), "%02X %s\r\n", (unsigned)languages[i].id, languages[i].name);
+
+        res = f_write(&lang_file, line, (UINT)n, &bw);
+        if (res != FR_OK || bw != (UINT)n) {
             printf("ERROR: writing language record %d failed\n", i);
             f_close(&lang_file);
             return false;
@@ -589,24 +1027,25 @@ static bool dict_add_unknown_word(const uint8_t *seq) {
         }
     }
     
-    // Create record: 2-byte language ID + 15-byte phoneme seq + 25-byte word
-    uint8_t record[DICT_RECORD_SIZE];
-    memset(record, 0, DICT_RECORD_SIZE);
-    
-    // Language ID = 0 (unknown)
-    record[0] = LANG_UNKNOWN & 0xFF;
-    record[1] = (LANG_UNKNOWN >> 8) & 0xFF;
-    
-    // Copy phoneme sequence
-    memcpy(&record[DICT_LANG_ID_SIZE], seq, PHONEME_SEQ_LEN);
-    
     // Generate word: "UnRecognisedXX"
     char word[DICT_WORD_SIZE];
     snprintf(word, DICT_WORD_SIZE, "UnRecognised%02d", unrecognised_counter);
-    memcpy(&record[DICT_LANG_ID_SIZE + DICT_PHONEME_SIZE], word, strlen(word));
-    
-    // Write record
-    res = f_write(&newwords, record, DICT_RECORD_SIZE, &bw);
+
+    char record_line[DICT_RECORD_SIZE + 1];
+    memset(record_line, ' ', sizeof(record_line));
+
+    for (int i = 0; i < PHONEME_SEQ_LEN; i++) {
+        int pos = i * 3;
+        snprintf(&record_line[pos], 3, "%02X", seq[i]);
+        record_line[pos + 2] = ' ';
+    }
+
+    size_t wlen = strnlen(word, DICT_WORD_SIZE);
+    memcpy(&record_line[DICT_HEX_FIELD_CHARS], word, wlen);
+    record_line[DICT_HEX_FIELD_CHARS + DICT_WORD_SIZE] = '\r';
+    record_line[DICT_HEX_FIELD_CHARS + DICT_WORD_SIZE + 1] = '\n';
+
+    res = f_write(&newwords, record_line, DICT_RECORD_SIZE, &bw);
     f_close(&newwords);
     
     if (res != FR_OK || bw != DICT_RECORD_SIZE) {
@@ -652,53 +1091,95 @@ static bool dict_init(void) {
     return true;
 }
 
+static int compare_seq_to_record(const uint8_t *lhs_seq, const uint8_t *rhs_seq) {
+    for (int i = 0; i < PHONEME_SEQ_LEN; i++) {
+        uint8_t lhs = lhs_seq[i];
+        uint8_t rhs = rhs_seq[i];
+        if (lhs < rhs) return -1;
+        if (lhs > rhs) return 1;
+    }
+    return 0;
+}
+
+static int hex_nibble_to_int(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
+    if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
+    return -1;
+}
+
+static bool dict_parse_record_line(const char *record, uint8_t *seq_out, char *word_out, size_t word_out_len) {
+    if (!record || !seq_out || !word_out || word_out_len < 2) return false;
+
+    for (int i = 0; i < PHONEME_SEQ_LEN; i++) {
+        int pos = i * 3;
+        int hi = hex_nibble_to_int(record[pos]);
+        int lo = hex_nibble_to_int(record[pos + 1]);
+        if (hi < 0 || lo < 0) return false;
+        seq_out[i] = (uint8_t)((hi << 4) | lo);
+    }
+
+    char raw_word[DICT_WORD_SIZE + 1];
+    memcpy(raw_word, &record[DICT_HEX_FIELD_CHARS], DICT_WORD_SIZE);
+    raw_word[DICT_WORD_SIZE] = '\0';
+
+    for (int i = DICT_WORD_SIZE - 1; i >= 0; i--) {
+        if (raw_word[i] == ' ' || raw_word[i] == '\0') raw_word[i] = '\0';
+        else break;
+    }
+
+    strncpy(word_out, raw_word, word_out_len - 1);
+    word_out[word_out_len - 1] = '\0';
+    return true;
+}
+
 static bool dict_lookup_word(const uint8_t *seq, char *word_out, size_t word_out_len) {
     if (!dict_ready || word_out_len < 2) return false;
 
-    // Record format: 2 bytes language ID + 15 bytes phoneme IDs + 25 bytes ASCII word (null-padded)
-    // Total: 42 bytes per record
+    // Record format: 15 two-digit hex values + spaces (45 chars) + 26-char word field + CRLF
     // Dictionary.dat is sorted by phoneme sequence (binary search possible)
     // NewWords.dat is sequential (linear search required)
 
-    uint8_t record[DICT_RECORD_SIZE];
+    char record[DICT_RECORD_SIZE + 1];
+    uint8_t record_seq[PHONEME_SEQ_LEN];
+    char record_word[DICT_WORD_SIZE + 1];
     UINT br;
     FRESULT res;
 
-    // First, search Dictionary.dat (sorted, can use binary search or linear with early exit)
-    res = f_lseek(&dict_file, 0);
-    if (res != FR_OK) return false;
+    // First, search Dictionary.dat using binary search (Dictionary.dat is sorted).
+    uint32_t record_count = (uint32_t)(f_size(&dict_file) / DICT_RECORD_SIZE);
+    if (record_count > 0) {
+        int32_t low = 0;
+        int32_t high = (int32_t)record_count - 1;
 
-    while (1) {
-        res = f_read(&dict_file, record, DICT_RECORD_SIZE, &br);
-        if (res != FR_OK || br < DICT_RECORD_SIZE) break;
+        while (low <= high) {
+            int32_t mid = low + ((high - low) / 2);
+            FSIZE_t offset = (FSIZE_t)mid * (FSIZE_t)DICT_RECORD_SIZE;
 
-        // Compare phoneme sequence (15 bytes starting at offset 2, after language ID)
-        bool match = true;
-        for (int i = 0; i < PHONEME_SEQ_LEN; i++) {
-            if (record[DICT_LANG_ID_SIZE + i] != seq[i]) {
-                match = false;
+            res = f_lseek(&dict_file, offset);
+            if (res != FR_OK) break;
+
+            res = f_read(&dict_file, record, DICT_RECORD_SIZE, &br);
+            if (res != FR_OK || br < DICT_RECORD_SIZE) break;
+            record[DICT_RECORD_SIZE] = '\0';
+
+            if (!dict_parse_record_line(record, record_seq, record_word, sizeof(record_word))) {
                 break;
             }
-        }
 
-        if (match) {
-            // Found it! Extract word (25 bytes starting at offset 17)
-            strncpy(word_out, (char *)&record[DICT_LANG_ID_SIZE + DICT_PHONEME_SIZE], word_out_len - 1);
-            word_out[word_out_len - 1] = '\0';
-            return true;
-        }
+            int cmp = compare_seq_to_record(seq, record_seq);
+            if (cmp == 0) {
+                strncpy(word_out, record_word, word_out_len - 1);
+                word_out[word_out_len - 1] = '\0';
+                return true;
+            }
 
-        // If sequence is lexicographically larger, dictionary is sorted so no match
-        bool is_less = false;
-        for (int i = 0; i < PHONEME_SEQ_LEN; i++) {
-            if (seq[i] < record[DICT_LANG_ID_SIZE + i]) {
-                is_less = true;
-                break;
-            } else if (seq[i] > record[DICT_LANG_ID_SIZE + i]) {
-                break;
+            if (cmp < 0) {
+                high = mid - 1;
+            } else {
+                low = mid + 1;
             }
         }
-        if (is_less) break;  // Dictionary is past our target, not in Dictionary.dat
     }
 
     // Not found in Dictionary.dat, try NewWords.dat
@@ -712,19 +1193,16 @@ static bool dict_lookup_word(const uint8_t *seq, char *word_out, size_t word_out
     while (1) {
         res = f_read(&newwords, record, DICT_RECORD_SIZE, &br);
         if (res != FR_OK || br < DICT_RECORD_SIZE) break;
+        record[DICT_RECORD_SIZE] = '\0';
 
-        // Compare phoneme sequence
-        bool match = true;
-        for (int i = 0; i < PHONEME_SEQ_LEN; i++) {
-            if (record[DICT_LANG_ID_SIZE + i] != seq[i]) {
-                match = false;
-                break;
-            }
+        if (!dict_parse_record_line(record, record_seq, record_word, sizeof(record_word))) {
+            break;
         }
 
+        int match = (compare_seq_to_record(seq, record_seq) == 0);
+
         if (match) {
-            // Found it in NewWords.dat
-            strncpy(word_out, (char *)&record[DICT_LANG_ID_SIZE + DICT_PHONEME_SIZE], word_out_len - 1);
+            strncpy(word_out, record_word, word_out_len - 1);
             word_out[word_out_len - 1] = '\0';
             f_close(&newwords);
             return true;
@@ -798,8 +1276,8 @@ static bool user_folder_prepare(const user_profile_t *user) {
     if (res != FR_OK) return false;
 
     char line[160];
-    int n = snprintf(line, sizeof(line), "Name: %s\r\nAge: %u\r\nGender: %s\r\n",
-                     user->full_name, user->age, user->gender);
+    int n = snprintf(line, sizeof(line), "Name: %s\r\nAge: %u\r\nGender: %s\r\nLanguage: %s\r\n",
+                     user->full_name, user->age, user->gender, user->language);
     UINT bw = 0;
     res = f_write(&file, line, (UINT)n, &bw);
     f_close(&file);
@@ -852,31 +1330,33 @@ static bool generate_sample_words(void) {
     bool progress = true;
     while (progress) {
         progress = false;
-        uint8_t best_record[DICT_RECORD_SIZE];
+        uint8_t best_seq[PHONEME_SEQ_LEN] = {0};
         int best_gain = 0;
-        char best_word[26] = {0};
+        char best_word[DICT_WORD_SIZE + 1] = {0};
 
         f_lseek(&dict, 0);
         UINT br = 0;
-        uint8_t record[DICT_RECORD_SIZE];
+        char record[DICT_RECORD_SIZE + 1];
+        uint8_t parsed_seq[PHONEME_SEQ_LEN];
+        char parsed_word[DICT_WORD_SIZE + 1];
         while (1) {
             res = f_read(&dict, record, DICT_RECORD_SIZE, &br);
             if (res != FR_OK || br < DICT_RECORD_SIZE) break;
+            record[DICT_RECORD_SIZE] = '\0';
 
-            // Phoneme sequence starts at offset 2 (after 2-byte language ID)
-            int pcount = phoneme_count(&record[DICT_LANG_ID_SIZE]);
+            if (!dict_parse_record_line(record, parsed_seq, parsed_word, sizeof(parsed_word))) {
+                continue;
+            }
+
+            int pcount = phoneme_count(parsed_seq);
             if (pcount == 0 || pcount > MAX_PHONEMES_PER_WORD) continue;
 
-            // Word starts at offset 17 (2-byte lang ID + 15-byte phoneme seq)
-            char word[26];
-            memcpy(word, &record[DICT_LANG_ID_SIZE + DICT_PHONEME_SIZE], DICT_WORD_SIZE);
-            word[DICT_WORD_SIZE] = '\0';
-            size_t wlen = strnlen(word, DICT_WORD_SIZE);
-            if (!word_is_short(word, wlen)) continue;
+            size_t wlen = strnlen(parsed_word, DICT_WORD_SIZE);
+            if (!word_is_short(parsed_word, wlen)) continue;
 
             int gain = 0;
             for (int i = 0; i < PHONEME_SEQ_LEN; i++) {
-                uint8_t id = record[DICT_LANG_ID_SIZE + i];
+                uint8_t id = parsed_seq[i];
                 if (id >= phoneme_min && id <= phoneme_max) {
                     int idx = id - phoneme_min;
                     if (counts[idx] < 3) gain++;
@@ -885,8 +1365,8 @@ static bool generate_sample_words(void) {
 
             if (gain > best_gain) {
                 best_gain = gain;
-                memcpy(best_record, record, DICT_RECORD_SIZE);
-                strncpy(best_word, word, sizeof(best_word) - 1);
+                memcpy(best_seq, parsed_seq, sizeof(best_seq));
+                strncpy(best_word, parsed_word, sizeof(best_word) - 1);
             }
         }
 
@@ -896,7 +1376,7 @@ static bool generate_sample_words(void) {
             f_write(&out, "\r\n", 2, &bw);
 
             for (int i = 0; i < PHONEME_SEQ_LEN; i++) {
-                uint8_t id = best_record[DICT_LANG_ID_SIZE + i];
+                uint8_t id = best_seq[i];
                 if (id >= phoneme_min && id <= phoneme_max) {
                     int idx = id - phoneme_min;
                     if (counts[idx] < 3) counts[idx]++;
@@ -985,6 +1465,40 @@ static bool dict_merge_new_words(void) {
     return true;
 }
 
+static uint8_t load_unrecognised_preview(void) {
+    unrec_preview_count = 0;
+
+    FIL newwords;
+    FRESULT res = f_open(&newwords, "0:/microsd/NewWords.dat", FA_READ | FA_OPEN_EXISTING);
+    if (res != FR_OK) {
+        return 0;
+    }
+
+    char record[DICT_RECORD_SIZE + 1];
+    uint8_t parsed_seq[PHONEME_SEQ_LEN];
+    char parsed_word[DICT_WORD_SIZE + 1];
+    UINT br;
+    while (unrec_preview_count < UNREC_PREVIEW_COUNT) {
+        res = f_read(&newwords, record, DICT_RECORD_SIZE, &br);
+        if (res != FR_OK || br < DICT_RECORD_SIZE) {
+            break;
+        }
+        record[DICT_RECORD_SIZE] = '\0';
+
+        if (!dict_parse_record_line(record, parsed_seq, parsed_word, sizeof(parsed_word))) {
+            continue;
+        }
+
+        strncpy(unrec_preview[unrec_preview_count], parsed_word,
+                sizeof(unrec_preview[unrec_preview_count]) - 1);
+        unrec_preview[unrec_preview_count][sizeof(unrec_preview[unrec_preview_count]) - 1] = '\0';
+        unrec_preview_count++;
+    }
+
+    f_close(&newwords);
+    return unrec_preview_count;
+}
+
 static bool dict_target_from_word(const char *word, uint8_t *target_out) {
     if (!dict_ready) return false;
 
@@ -992,20 +1506,22 @@ static bool dict_target_from_word(const char *word, uint8_t *target_out) {
     if (f_open(&dict, "0:/microsd/Dictionary.dat", FA_READ | FA_OPEN_EXISTING) != FR_OK) return false;
 
     UINT br = 0;
-    uint8_t record[DICT_RECORD_SIZE];
+    char record[DICT_RECORD_SIZE + 1];
+    uint8_t parsed_seq[PHONEME_SEQ_LEN];
+    char parsed_word[DICT_WORD_SIZE + 1];
     bool found = false;
 
     while (1) {
         if (f_read(&dict, record, DICT_RECORD_SIZE, &br) != FR_OK || br < DICT_RECORD_SIZE) break;
+        record[DICT_RECORD_SIZE] = '\0';
 
-        // Extract word (25 bytes starting at offset 17: 2-byte lang ID + 15-byte phoneme seq)
-        char w[26];
-        memcpy(w, &record[DICT_LANG_ID_SIZE + DICT_PHONEME_SIZE], DICT_WORD_SIZE);
-        w[DICT_WORD_SIZE] = '\0';
-        if (strcasecmp_local(w, word) == 0) {
-            // Find first valid phoneme ID in sequence (offset 2 for lang ID)
+        if (!dict_parse_record_line(record, parsed_seq, parsed_word, sizeof(parsed_word))) {
+            continue;
+        }
+
+        if (strcasecmp_local(parsed_word, word) == 0) {
             for (int i = 0; i < PHONEME_SEQ_LEN; i++) {
-                uint8_t id = record[DICT_LANG_ID_SIZE + i];
+                uint8_t id = parsed_seq[i];
                 if (id >= 0x05 && id <= 0x2C) {
                     *target_out = id;
                     found = true;
@@ -1184,8 +1700,8 @@ static void training_stop(void) {
         sample_file_open = false;
     }
     train_state = TRAIN_IDLE;
-    menu_state = MENU_HOME;
-    menu_render_home();
+    menu_state = MENU_SCREEN0;
+    menu_render_screen0();
 }
 
 static void training_tick(void) {
@@ -1409,7 +1925,7 @@ static void handle_stage2_entry(uint8_t beam_idx, const stage2_entry_t *entry) {
         return;
     }
 
-    char word[26];
+    char word[DICT_WORD_SIZE + 1];
     if (dict_lookup_word(seq->seq, word, sizeof(word))) {
         const char *gender = (entry->female_val >= entry->male_val) ? "female" : "male";
         uint8_t conf = (entry->female_val >= entry->male_val) ? entry->female_val : entry->male_val;
@@ -1418,14 +1934,14 @@ static void handle_stage2_entry(uint8_t beam_idx, const stage2_entry_t *entry) {
                  beam_idx, entry->user_id, user_name, word, gender, conf);
         output_send_line(line);
         if (beam_idx == TRAIN_BEAM_INDEX) {
-            recent_words_push(word, gender);
+            word_history_push(word);
         }
         seq->count = 0; // reset after a match
     } else {
         // Word not found - add to dictionary with language ID 0 (unknown)
         if (dict_add_unknown_word(seq->seq)) {
             // Successfully added - output the new unrecognised word
-            char unrec_word[26];
+            char unrec_word[DICT_WORD_SIZE + 1];
             snprintf(unrec_word, sizeof(unrec_word), "UnRecognised%02d", unrecognised_counter - 1);
             const char *gender = (entry->female_val >= entry->male_val) ? "female" : "male";
             uint8_t conf = (entry->female_val >= entry->male_val) ? entry->female_val : entry->male_val;
@@ -1434,7 +1950,7 @@ static void handle_stage2_entry(uint8_t beam_idx, const stage2_entry_t *entry) {
                      beam_idx, entry->user_id, user_name, unrec_word, gender, conf);
             output_send_line(line);
             if (beam_idx == TRAIN_BEAM_INDEX) {
-                recent_words_push(unrec_word, gender);
+                word_history_push(unrec_word);
             }
         }
         seq->count = 0; // reset regardless
@@ -1677,108 +2193,189 @@ static bool run_backprop_training(void) {
 
 static void menu_handle_key(char key) {
     switch (menu_state) {
-        case MENU_HOME:
-            if (key == 'A') {
-                menu_state = MENU_SELECT_USER;
-                input_reset();
-                menu_render_input("Select user:");
-            } else if (key == 'B') {
+        case MENU_SCREEN0:
+            if (key == '#') {
+                menu_state = MENU_MAIN;
+                menu_main_page = 0;
+                menu_render_main();
+            }
+            break;
+
+        case MENU_MAIN:
+            if (key == '1') {
                 menu_state = MENU_NEW_USER;
-                new_user_step = 0;
-                input_reset();
-                menu_render_input("Username:");
-            } else if (key == 'C') {
+                add_user_start();
+            } else if (menu_main_page == 0 && key == '2') {
+                menu_state = MENU_SELECT_USER;
+                user_menu_start();
+            } else if (menu_main_page == 1 && key == '3') {
                 menu_state = MENU_TRAIN_CAPTURE;
                 training_start();
-            } else if (key == 'D') {
-                menu_state = MENU_BACKPROP;
+            } else if (menu_main_page == 1 && key == '4') {
+                load_unrecognised_preview();
+                menu_state = MENU_SELECT_UNREC;
+                menu_render_unrec_select();
+            } else if (menu_main_page == 1 && key == '5') {
+                menu_state = MENU_SPEECH_GEN_TRAIN;
                 lcd_clear();
                 lcd_set_cursor(0, 0);
-                lcd_print("Backprop... ");
+                lcd_print("SpeechGen Train");
                 if (run_backprop_training()) {
                     lcd_set_cursor(0, 1);
                     lcd_print("Done");
+                    lcd_set_status("Status: SG train OK");
                 } else {
                     lcd_set_cursor(0, 1);
                     lcd_print("Failed");
+                    lcd_set_status("Status: SG train fail");
                 }
-                menu_state = MENU_HOME;
-                menu_render_home();
+                sleep_ms(1200);
+                menu_state = MENU_SCREEN0;
+                menu_render_screen0();
+            } else if (key == 'B' && menu_main_page == 0) {
+                menu_main_page = 1;
+                menu_render_main();
+            } else if (key == 'A' && menu_main_page == 1) {
+                menu_main_page = 0;
+                menu_render_main();
+            } else if (key == '*') {
+                menu_state = MENU_SCREEN0;
+                menu_render_screen0();
             }
             break;
+
         case MENU_SELECT_USER:
-        case MENU_NEW_USER:
-            if (key == '#') {
-                if (menu_state == MENU_SELECT_USER) {
-                    strncpy(current_user.username, input_buffer_line, sizeof(current_user.username) - 1);
-                    current_user.username[sizeof(current_user.username) - 1] = '\0';
+            if (key == 'A' && user_menu_count > 0) {
+                user_menu_index = (user_menu_index == 0) ? (uint8_t)(user_menu_count - 1) : (uint8_t)(user_menu_index - 1);
+                menu_render_user_menu();
+            } else if (key == 'B' && user_menu_count > 0) {
+                user_menu_index = (uint8_t)((user_menu_index + 1) % user_menu_count);
+                menu_render_user_menu();
+            } else if (key == '#') {
+                if (user_menu_count > 0) {
+                    memset(&current_user, 0, sizeof(current_user));
+                    make_username_from_name(user_menu_names[user_menu_index],
+                                            user_menu_ids[user_menu_index],
+                                            current_user.username,
+                                            sizeof(current_user.username));
+                    strncpy(current_user.full_name, user_menu_names[user_menu_index], sizeof(current_user.full_name) - 1);
+                    current_user.full_name[sizeof(current_user.full_name) - 1] = '\0';
                     current_user.set = true;
-                    menu_state = MENU_HOME;
-                    menu_render_home();
-                } else {
-                    if (new_user_step == 0) {
-                        strncpy(current_user.username, input_buffer_line, sizeof(current_user.username) - 1);
-                        current_user.username[sizeof(current_user.username) - 1] = '\0';
-                        new_user_step = 1;
-                        input_reset();
-                        menu_render_input("Full name:");
-                    } else if (new_user_step == 1) {
-                        strncpy(pending_full_name, input_buffer_line, sizeof(pending_full_name) - 1);
-                        pending_full_name[sizeof(pending_full_name) - 1] = '\0';
-                        new_user_step = 2;
-                        input_reset();
-                        menu_render_input("Age:");
-                    } else if (new_user_step == 2) {
-                        pending_age = (uint8_t)atoi(input_buffer_line);
-                        new_user_step = 3;
-                        input_reset();
-                        menu_render_input("Gender:");
-                    } else if (new_user_step == 3) {
-                        strncpy(pending_gender, input_buffer_line, sizeof(pending_gender) - 1);
-                        pending_gender[sizeof(pending_gender) - 1] = '\0';
-
-                        strncpy(current_user.full_name, pending_full_name, sizeof(current_user.full_name) - 1);
-                        current_user.full_name[sizeof(current_user.full_name) - 1] = '\0';
-                        strncpy(current_user.gender, pending_gender, sizeof(current_user.gender) - 1);
-                        current_user.gender[sizeof(current_user.gender) - 1] = '\0';
-                        current_user.age = pending_age;
-                        current_user.set = true;
-
-                        if (!user_folder_prepare(&current_user)) {
-                            output_send_line("ERROR: User data save failed");
-                        }
-
-                        menu_state = MENU_HOME;
-                        menu_render_home();
-                    }
+                    lcd_set_status("Status: user selected");
                 }
+                menu_state = MENU_SCREEN0;
+                menu_render_screen0();
             } else if (key == '*') {
-                input_reset();
-                if (menu_state == MENU_SELECT_USER) {
-                    menu_render_input("Select user:");
-                } else {
-                    if (new_user_step == 0) menu_render_input("Username:");
-                    else if (new_user_step == 1) menu_render_input("Full name:");
-                    else if (new_user_step == 2) menu_render_input("Age:");
-                    else menu_render_input("Gender:");
+                menu_state = MENU_MAIN;
+                menu_render_main();
+            }
+            break;
+
+        case MENU_NEW_USER:
+            if (key == '*') {
+                menu_state = MENU_MAIN;
+                menu_render_main();
+                break;
+            }
+
+            if (add_user_step == ADD_USER_STEP_NAME) {
+                if (key == 'A') {
+                    add_user_name[add_user_cursor] = add_user_next_char(add_user_name[add_user_cursor]);
+                    menu_render_add_user();
+                } else if (key == 'B') {
+                    add_user_name[add_user_cursor] = add_user_prev_char(add_user_name[add_user_cursor]);
+                    menu_render_add_user();
+                } else if (key == 'D') {
+                    if (add_user_cursor + 1 < ADD_USER_NAME_MAX) {
+                        add_user_cursor++;
+                        if (add_user_cursor >= add_user_name_len) {
+                            add_user_name[add_user_cursor] = 'A';
+                            add_user_name[add_user_cursor + 1] = '\0';
+                            add_user_name_len = (uint8_t)(add_user_cursor + 1);
+                        }
+                        menu_render_add_user();
+                    }
+                } else if (key == 'C') {
+                    if (add_user_cursor > 0) {
+                        add_user_cursor--;
+                        menu_render_add_user();
+                    }
+                } else if (key == '#') {
+                    add_user_step = ADD_USER_STEP_GENDER;
+                    menu_render_add_user();
+                }
+            } else if (add_user_step == ADD_USER_STEP_GENDER) {
+                if (key == 'A' || key == 'B') {
+                    add_user_gender_male = !add_user_gender_male;
+                    menu_render_add_user();
+                } else if (key == '#') {
+                    add_user_step = ADD_USER_STEP_LANGUAGE;
+                    menu_render_add_user();
                 }
             } else {
-                input_append(key);
-                if (menu_state == MENU_SELECT_USER) {
-                    menu_render_input("Select user:");
-                } else {
-                    if (new_user_step == 0) menu_render_input("Username:");
-                    else if (new_user_step == 1) menu_render_input("Full name:");
-                    else if (new_user_step == 2) menu_render_input("Age:");
-                    else menu_render_input("Gender:");
+                if (key == 'A' || key == 'B') {
+                    uint8_t count = language_record_count();
+                    if (count == 0) count = 1;
+
+                    if (key == 'A') {
+                        add_user_lang_index = (uint8_t)((add_user_lang_index + 1) % count);
+                    } else {
+                        add_user_lang_index = (add_user_lang_index == 0) ? (uint8_t)(count - 1) : (uint8_t)(add_user_lang_index - 1);
+                    }
+
+                    language_name_from_index(add_user_lang_index, add_user_language, sizeof(add_user_language));
+                    menu_render_add_user();
+                } else if (key == '#') {
+                    memset(&current_user, 0, sizeof(current_user));
+                    make_username_from_name(add_user_name, add_user_id, current_user.username, sizeof(current_user.username));
+                    strncpy(current_user.full_name, add_user_name, sizeof(current_user.full_name) - 1);
+                    current_user.full_name[sizeof(current_user.full_name) - 1] = '\0';
+                    strncpy(current_user.gender, add_user_gender_male ? "Male" : "Female", sizeof(current_user.gender) - 1);
+                    current_user.gender[sizeof(current_user.gender) - 1] = '\0';
+                    strncpy(current_user.language, add_user_language, sizeof(current_user.language) - 1);
+                    current_user.language[sizeof(current_user.language) - 1] = '\0';
+                    current_user.age = 0;
+                    current_user.set = true;
+
+                    bool list_ok = user_list_set_name(add_user_id, add_user_name);
+                    bool profile_ok = user_folder_prepare(&current_user);
+
+                    if (!list_ok || !profile_ok) {
+                        output_send_line("ERROR: Add user save failed");
+                        lcd_set_status("SD ERR: user save");
+                    } else {
+                        lcd_set_status("Status: user added");
+                    }
+
+                    menu_state = MENU_MAIN;
+                    menu_render_main();
                 }
             }
             break;
+
+        case MENU_SELECT_UNREC:
+            if (key >= '1' && key <= '3') {
+                uint8_t idx = (uint8_t)(key - '1');
+                if (idx < unrec_preview_count) {
+                    char line[64];
+                    snprintf(line, sizeof(line), "Selected unrec: %s", unrec_preview[idx]);
+                    output_send_line(line);
+                    lcd_set_status("Status: unrec selected");
+                }
+                menu_state = MENU_MAIN;
+                menu_render_main();
+            } else if (key == '*') {
+                menu_state = MENU_MAIN;
+                menu_render_main();
+            }
+            break;
+
         case MENU_TRAIN_CAPTURE:
             if (key == '*') {
                 training_stop();
-                menu_state = MENU_HOME;
-                menu_render_home();
+                lcd_set_status("Status: training stop");
+                menu_state = MENU_SCREEN0;
+                menu_render_screen0();
             }
             break;
         default:
@@ -1797,21 +2394,26 @@ int main(void) {
     init_spi_sd();
     init_uart_ttl();
     lcd_init();
-    menu_render_home();
 
-    for (int i = 0; i < RECENT_WORDS; i++) {
-        recent_lines[i][0] = '\0';
+    for (int i = 0; i < WORD_HISTORY_COUNT; i++) {
+        word_history[i][0] = '\0';
     }
+    word_history_count = 0;
+    lcd_set_status("Status: Booting");
+    menu_render_screen0();
 
     output_send_line("Speech Recognition Translator starting...");
 
     // Initialize SD card and dictionary
     if (dict_init()) {
         output_send_line("Dictionary loaded successfully");
+        lcd_set_status("Status: Ready");
         generate_sample_words();
     } else {
         output_send_line("ERROR: Failed to load dictionary");
+        lcd_set_status("SD ERR: dict init");
     }
+    menu_render_screen0();
 
     while (1) {
         char line[160];
