@@ -21,6 +21,7 @@
 
 #define STAGE2_BASE_ADDR 0x60
 #define STAGE2_COUNT 5
+#define STAGE4_ADDR 0x65
 
 // Stage 2 registers
 #define STAGE2_REG_CONTROL    0x00
@@ -31,6 +32,13 @@
 #define STAGE2_REG_PAGE_ADDR  0x0D
 #define STAGE2_REG_PAGE_LEN   0x0E
 #define STAGE2_REG_PAGE_DATA  0x0F
+#define STAGE2_REG_LAST_MAX_ID 0x10
+#define STAGE2_REG_LAST_MAX_VAL 0x11
+#define STAGE2_REG_LAST_TARGET_VAL 0x12
+#define STAGE2_REG_LAST_USER_ID 0x13
+#define STAGE2_REG_LAST_USER_VAL 0x14
+#define STAGE2_REG_LAST_FEMALE_VAL 0x15
+#define STAGE2_REG_LAST_MALE_VAL 0x16
 
 // Stage 2 page modes
 #define STAGE2_PAGE_NONE  0x00
@@ -43,6 +51,22 @@
 // Stage 2 control bits (write 0x06 to freeze + pause)
 #define STAGE2_CTRL_FREEZE_PAUSE 0x0006
 #define STAGE2_CTRL_BACKPROP 0x0004
+
+// Stage 4 registers (Speech_Generation)
+#define STAGE4_REG_CONTROL_STATUS 0x00
+#define STAGE4_REG_IMAGE_LINE_PTR 0x10
+#define STAGE4_REG_IMAGE_DATA 0x11
+#define STAGE4_REG_GEN_PHONEME 0x12
+#define STAGE4_REG_GEN_COMMAND 0x13
+#define STAGE4_REG_TRAIN_FEEDBACK 0x14
+#define STAGE4_REG_TRAIN_TARGET 0x15
+
+#define STAGE4_CMD_GENERATE_IMAGE 0x01
+#define STAGE4_CMD_BACKPROP_STEP 0x02
+#define STAGE4_CMD_RESET_IMAGE_PTR 0x04
+
+#define STAGE4_IMAGE_BINS 40
+#define STAGE4_IMAGE_LINES 100
 
 // ==============================
 // LCD (PCF8574, HD44780, 20x4)
@@ -78,6 +102,9 @@ typedef enum {
     MENU_NEW_USER,
     MENU_TRAIN_CAPTURE,
     MENU_SELECT_UNREC,
+    MENU_STAGE2_ANN_CONFIRM,
+    MENU_SAVE_ANN_CONFIRM,
+    MENU_LOAD_ANN_SELECT,
     MENU_SPEECH_GEN_TRAIN
 } menu_state_t;
 
@@ -109,6 +136,11 @@ static uint8_t user_menu_ids[USER_MENU_MAX] = {0};
 static char user_menu_names[USER_MENU_MAX][26];
 static uint8_t user_menu_count = 0;
 static uint8_t user_menu_index = 0;
+
+#define ANN_VERSION_MAX 100
+static uint8_t ann_versions[ANN_VERSION_MAX] = {0};
+static uint8_t ann_version_count = 0;
+static uint8_t ann_version_index = 0;
 
 // LCD history/state
 #define WORD_HISTORY_COUNT 10
@@ -177,13 +209,17 @@ typedef struct {
 #define PHONEME_SEQ_LEN 15
 
 // Dictionary text format (fixed width, binary-search friendly):
-// 15 hex bytes with trailing spaces (45 chars) + 26-char word field + CRLF (2 chars)
+// 15 hex bytes with trailing spaces (45 chars) + 2-char language ID + space + 26-char word + CRLF (2 chars)
 // Example:
-// "05 10 15 21 00 00 00 00 00 00 00 00 00 00 00 hello                     \r\n"
+// "05 10 15 21 00 00 00 00 00 00 00 00 00 00 00 00 hello                     \r\n"
 #define DICT_HEX_FIELD_CHARS 45
+#define DICT_LANG_ID_CHARS 2
+#define DICT_LANG_SEP_CHARS 1
+#define DICT_LANG_OFFSET DICT_HEX_FIELD_CHARS
+#define DICT_WORD_OFFSET (DICT_HEX_FIELD_CHARS + DICT_LANG_ID_CHARS + DICT_LANG_SEP_CHARS)
 #define DICT_WORD_SIZE 26
 #define DICT_LINE_END_CHARS 2
-#define DICT_RECORD_SIZE (DICT_HEX_FIELD_CHARS + DICT_WORD_SIZE + DICT_LINE_END_CHARS)
+#define DICT_RECORD_SIZE (DICT_HEX_FIELD_CHARS + DICT_LANG_ID_CHARS + DICT_LANG_SEP_CHARS + DICT_WORD_SIZE + DICT_LINE_END_CHARS)
 
 // Language file format: "HH Name\r\n" (2-digit hex ID, space, text name)
 #define LANG_RECORD_SIZE 32
@@ -215,18 +251,22 @@ typedef struct {
 #define INPUT_PERIOD_MS 16
 #define PEAK_WINDOW_SECONDS 2
 #define PEAK_WINDOW_FRAMES (PEAK_WINDOW_SECONDS * 1000 / INPUT_PERIOD_MS)
-#define CAPTURE_FRAMES 80
+#define CAPTURE_FRAMES 100
+#define CAPTURE_FRAME_BYTES 40
 #define MAX_WORD_LEN 24
 #define MAX_PHONEMES_PER_WORD 8
+#define TRAIN_WORDS_MAX 120
+#define TRAIN_MIN_SPOKEN_FRAMES 6
+#define STAGE2_CERTAINTY_THRESHOLD 204
+#define STAGE2_ANN_MAX_EPOCHS 20
+#define STAGE4_TRAIN_MAX_EPOCHS 20
 
 // Forward declaration of training state
 typedef enum {
     TRAIN_IDLE = 0,
-    TRAIN_SHOW_WORD,
     TRAIN_WAIT_TRIGGER,
     TRAIN_CAPTURE,
-    TRAIN_SAVE,
-    TRAIN_NEXT
+    TRAIN_SAVE
 } train_state_t;
 
 static train_state_t train_state = TRAIN_IDLE;
@@ -234,6 +274,7 @@ static train_state_t train_state = TRAIN_IDLE;
 typedef struct {
     char username[32];
     char full_name[64];
+    uint8_t user_id;
     uint8_t age;
     char gender[8];
     char language[31];
@@ -241,6 +282,11 @@ typedef struct {
 } user_profile_t;
 
 static user_profile_t current_user = {0};
+
+static char training_words[TRAIN_WORDS_MAX][DICT_WORD_SIZE + 1];
+static uint16_t training_word_count = 0;
+static uint16_t training_word_index = 0;
+static bool training_words_loaded = false;
 
 typedef struct {
     uint8_t seq[PHONEME_SEQ_LEN];
@@ -479,13 +525,97 @@ static void menu_render_main(void) {
 
     if (menu_main_page == 0) {
         lcd_print_padded_line(1, "1:Add New User");
-        lcd_print_padded_line(2, "2:Select User");
+        lcd_print_padded_line(2, "2:Sel User 3:Train");
         lcd_print_padded_line(3, "B:Pg1  *:Exit");
+    } else if (menu_main_page == 1) {
+        lcd_print_padded_line(1, "4:Unrec 5:SpGen");
+        lcd_print_padded_line(2, "6:Stage2 ANN Trn");
+        lcd_print_padded_line(3, "A:Pg0 B:Pg2");
+    } else if (menu_main_page == 2) {
+        lcd_print_padded_line(1, "7:Save ANN");
+        lcd_print_padded_line(2, "8:Load ANN");
+        lcd_print_padded_line(3, "A:Pg1  *:Exit");
     } else {
-        lcd_print_padded_line(1, "1:Add New User");
-        lcd_print_padded_line(2, "3:Train 4:Unrec");
-        lcd_print_padded_line(3, "5:SpeechGen A:Pg0");
+        menu_main_page = 2;
+        lcd_print_padded_line(1, "7:Save ANN");
+        lcd_print_padded_line(2, "8:Load ANN");
+        lcd_print_padded_line(3, "A:Pg1  *:Exit");
     }
+}
+
+static void menu_render_stage2_ann_confirm(void) {
+    lcd_clear();
+    lcd_print_padded_line(0, "Stage 2 ANN Train");
+    lcd_print_padded_line(1, "Are you sure?");
+    lcd_print_padded_line(2, "#:Yes");
+    lcd_print_padded_line(3, "*:No");
+}
+
+static void menu_render_save_ann_confirm(void) {
+    lcd_clear();
+    lcd_print_padded_line(0, "Save ANN");
+    lcd_print_padded_line(1, "Are you sure?");
+    lcd_print_padded_line(2, "#:Yes");
+    lcd_print_padded_line(3, "*:No");
+}
+
+static void menu_render_load_ann_select(void) {
+    lcd_clear();
+    lcd_print_padded_line(0, "Load Speech ANN");
+
+    if (ann_version_count == 0) {
+        lcd_print_padded_line(1, "No saved ANN files");
+        lcd_print_padded_line(2, "");
+        lcd_print_padded_line(3, "*:Back");
+        return;
+    }
+
+    uint8_t version = ann_versions[ann_version_index];
+    char line1[21];
+    snprintf(line1, sizeof(line1), "Sel: ANN v%02u", (unsigned)version);
+    lcd_print_padded_line(1, line1);
+
+    char line2[21];
+    snprintf(line2,
+             sizeof(line2),
+             "%u/%u",
+             (unsigned)(ann_version_index + 1),
+             (unsigned)ann_version_count);
+    lcd_print_padded_line(2, line2);
+    lcd_print_padded_line(3, "A/B:Sel #:Load *:Bk");
+}
+
+static void menu_render_load_ann_progress(uint8_t version, uint8_t step, uint8_t total_steps) {
+    lcd_clear();
+    char line0[21];
+    snprintf(line0, sizeof(line0), "Load ANN v%02u", (unsigned)version);
+    lcd_print_padded_line(0, line0);
+
+    char line1[21];
+    snprintf(line1, sizeof(line1), "Device %u/%u", (unsigned)step, (unsigned)total_steps);
+    lcd_print_padded_line(1, line1);
+
+    uint8_t progress = (total_steps > 0) ? (uint8_t)((step * 100u) / total_steps) : 0;
+    char line2[21];
+    snprintf(line2, sizeof(line2), "Progress:%3u%%", (unsigned)progress);
+    lcd_print_padded_line(2, line2);
+    lcd_print_padded_line(3, "Please wait...");
+}
+
+static void menu_render_save_ann_progress(uint8_t version, const char *phase, uint8_t progress_pct) {
+    lcd_clear();
+    char line0[21];
+    snprintf(line0, sizeof(line0), "Save ANN v%02u", (unsigned)version);
+    lcd_print_padded_line(0, line0);
+
+    char line1[21];
+    snprintf(line1, sizeof(line1), "%s", (phase && phase[0]) ? phase : "Working");
+    lcd_print_padded_line(1, line1);
+
+    char line2[21];
+    snprintf(line2, sizeof(line2), "Progress:%3u%%", (unsigned)progress_pct);
+    lcd_print_padded_line(2, line2);
+    lcd_print_padded_line(3, "Please wait...");
 }
 
 static char add_user_next_char(char c) {
@@ -568,6 +698,31 @@ static bool language_name_from_index(uint8_t index, char *name_out, size_t name_
     }
 
     return found;
+}
+
+static uint8_t language_id_from_name(const char *name) {
+    if (!name || name[0] == '\0') return LANG_UNKNOWN;
+
+    FIL lang_file;
+    if (f_open(&lang_file, "0:/microsd/Language.dat", FA_READ | FA_OPEN_EXISTING) != FR_OK) {
+        return LANG_UNKNOWN;
+    }
+
+    char line[96];
+    uint8_t found_id = LANG_UNKNOWN;
+
+    while (f_gets(line, sizeof(line), &lang_file)) {
+        uint8_t parsed_id = 0;
+        char parsed_name[LANG_NAME_SIZE + 1] = {0};
+        if (!language_parse_line(line, &parsed_id, parsed_name, sizeof(parsed_name))) continue;
+        if (strcasecmp_local(parsed_name, name) != 0) continue;
+
+        found_id = parsed_id;
+        break;
+    }
+
+    f_close(&lang_file);
+    return found_id;
 }
 
 static uint8_t language_record_count(void) {
@@ -848,6 +1003,114 @@ static void menu_render_input(const char *title) {
     lcd_print("#:OK  *:CLR");
 }
 
+static void lcd_print_centered_line(uint8_t row, const char *text) {
+    char line[21];
+    memset(line, ' ', 20);
+    line[20] = '\0';
+
+    if (text && text[0] != '\0') {
+        size_t len = strnlen(text, 20);
+        size_t left = (20 - len) / 2;
+        memcpy(&line[left], text, len);
+    }
+
+    lcd_set_cursor(0, row);
+    lcd_print(line);
+}
+
+static bool training_word_capture_exists(const user_profile_t *user, const char *word) {
+    if (!user || !user->set || !word || word[0] == '\0') return false;
+
+    char path[160];
+    snprintf(path, sizeof(path), "0:/microsd/%s/%s.dat", user->username, word);
+    FILINFO fno;
+    return f_stat(path, &fno) == FR_OK;
+}
+
+static bool load_training_words_from_file(const char *path) {
+    FIL file;
+    if (f_open(&file, path, FA_READ | FA_OPEN_EXISTING) != FR_OK) return false;
+
+    training_word_count = 0;
+    training_word_index = 0;
+
+    char line[96];
+    while (f_gets(line, sizeof(line), &file) && training_word_count < TRAIN_WORDS_MAX) {
+        size_t l = strcspn(line, "\r\n");
+        line[l] = '\0';
+        if (line[0] == '\0' || line[0] == '#') continue;
+
+        strncpy(training_words[training_word_count], line, DICT_WORD_SIZE);
+        training_words[training_word_count][DICT_WORD_SIZE] = '\0';
+        training_word_count++;
+    }
+
+    f_close(&file);
+    return training_word_count > 0;
+}
+
+static bool training_words_load_for_current_user(void) {
+    if (!current_user.set) return false;
+
+    char lang_name[LANG_NAME_SIZE + 1] = "English";
+    if (current_user.language[0] != '\0') {
+        strncpy(lang_name, current_user.language, sizeof(lang_name) - 1);
+        lang_name[sizeof(lang_name) - 1] = '\0';
+    }
+
+    char path[160];
+    snprintf(path, sizeof(path), "0:/microsd/TrainingWords_%s.txt", lang_name);
+    if (load_training_words_from_file(path)) return true;
+
+    for (size_t i = 0; lang_name[i] != '\0'; i++) {
+        if (lang_name[i] == ' ') lang_name[i] = '_';
+    }
+    snprintf(path, sizeof(path), "0:/microsd/TrainingWords_%s.txt", lang_name);
+    if (load_training_words_from_file(path)) return true;
+
+    return load_training_words_from_file("0:/microsd/SampleWords.txt");
+}
+
+static void menu_render_training_menu(void) {
+    lcd_clear();
+
+    if (!current_user.set) {
+        lcd_print_padded_line(0, "Training Memnu");
+        lcd_print_padded_line(1, "No user selected");
+        lcd_print_padded_line(2, "Select user first");
+        lcd_print_padded_line(3, "*:Back");
+        return;
+    }
+
+    if (!training_words_loaded || training_word_count == 0) {
+        lcd_print_padded_line(0, "Training Memnu");
+        lcd_print_padded_line(1, "No training words");
+        lcd_print_padded_line(2, "Generate list first");
+        lcd_print_padded_line(3, "*:Back");
+        return;
+    }
+
+    char line0[21];
+    snprintf(line0, sizeof(line0), "Training Memnu %u/%u",
+             (unsigned)(training_word_index + 1),
+             (unsigned)training_word_count);
+    lcd_print_padded_line(0, line0);
+
+    lcd_print_centered_line(1, training_words[training_word_index]);
+
+    if (training_word_capture_exists(&current_user, training_words[training_word_index])) {
+        lcd_print_padded_line(2, "Recording: Present");
+    } else {
+        lcd_print_padded_line(2, "Recording: Missing");
+    }
+
+    if (train_state == TRAIN_WAIT_TRIGGER || train_state == TRAIN_CAPTURE) {
+        lcd_print_centered_line(3, "Speak When Ready");
+    } else {
+        lcd_print_padded_line(3, "A/B:Scroll #:Train");
+    }
+}
+
 // ==============================
 // Dictionary lookup with FatFs
 // ==============================
@@ -860,6 +1123,45 @@ static bool newwords_ready = false;
 static uint16_t unrecognised_counter = 0;
 
 static bool ensure_microsd_dir(void);
+static bool stage2_load_nn_from_sd(uint8_t addr, const char *path);
+
+static bool ensure_logs_dir(void) {
+    if (!ensure_microsd_dir()) return false;
+    FRESULT res = f_mkdir("0:/microsd/logs");
+    return (res == FR_OK || res == FR_EXIST);
+}
+
+static void ann_log_emit(const char *username, const char *line) {
+    if (!line || line[0] == '\0') return;
+
+    output_send_line(line);
+
+    if (!sd_ready) return;
+    if (!ensure_logs_dir()) return;
+
+    char path[192];
+    if (username && username[0] != '\0') {
+        snprintf(path, sizeof(path), "0:/microsd/logs/%s_ann_train.log", username);
+    } else {
+        snprintf(path, sizeof(path), "0:/microsd/logs/ann_train.log");
+    }
+
+    FIL log_file;
+    FRESULT res = f_open(&log_file, path, FA_WRITE | FA_OPEN_APPEND);
+    if (res != FR_OK) {
+        res = f_open(&log_file, path, FA_WRITE | FA_CREATE_ALWAYS);
+    }
+    if (res != FR_OK) return;
+
+    UINT bw = 0;
+    size_t len = strnlen(line, 220);
+    if (len > 0) {
+        f_write(&log_file, line, (UINT)len, &bw);
+    }
+    const char *crlf = "\r\n";
+    f_write(&log_file, crlf, 2, &bw);
+    f_close(&log_file);
+}
 
 static bool create_language_file(void) {
     FIL lang_file;
@@ -1031,6 +1333,11 @@ static bool dict_add_unknown_word(const uint8_t *seq) {
     char word[DICT_WORD_SIZE];
     snprintf(word, DICT_WORD_SIZE, "UnRecognised%02d", unrecognised_counter);
 
+    uint8_t language_id = LANG_UNKNOWN;
+    if (current_user.set && current_user.language[0] != '\0') {
+        language_id = language_id_from_name(current_user.language);
+    }
+
     char record_line[DICT_RECORD_SIZE + 1];
     memset(record_line, ' ', sizeof(record_line));
 
@@ -1040,10 +1347,13 @@ static bool dict_add_unknown_word(const uint8_t *seq) {
         record_line[pos + 2] = ' ';
     }
 
+    snprintf(&record_line[DICT_LANG_OFFSET], 3, "%02X", language_id);
+    record_line[DICT_LANG_OFFSET + DICT_LANG_ID_CHARS] = ' ';
+
     size_t wlen = strnlen(word, DICT_WORD_SIZE);
-    memcpy(&record_line[DICT_HEX_FIELD_CHARS], word, wlen);
-    record_line[DICT_HEX_FIELD_CHARS + DICT_WORD_SIZE] = '\r';
-    record_line[DICT_HEX_FIELD_CHARS + DICT_WORD_SIZE + 1] = '\n';
+    memcpy(&record_line[DICT_WORD_OFFSET], word, wlen);
+    record_line[DICT_WORD_OFFSET + DICT_WORD_SIZE] = '\r';
+    record_line[DICT_WORD_OFFSET + DICT_WORD_SIZE + 1] = '\n';
 
     res = f_write(&newwords, record_line, DICT_RECORD_SIZE, &bw);
     f_close(&newwords);
@@ -1108,7 +1418,7 @@ static int hex_nibble_to_int(char c) {
     return -1;
 }
 
-static bool dict_parse_record_line(const char *record, uint8_t *seq_out, char *word_out, size_t word_out_len) {
+static bool dict_parse_record_line(const char *record, uint8_t *seq_out, uint8_t *language_id_out, char *word_out, size_t word_out_len) {
     if (!record || !seq_out || !word_out || word_out_len < 2) return false;
 
     for (int i = 0; i < PHONEME_SEQ_LEN; i++) {
@@ -1119,8 +1429,15 @@ static bool dict_parse_record_line(const char *record, uint8_t *seq_out, char *w
         seq_out[i] = (uint8_t)((hi << 4) | lo);
     }
 
+    int lang_hi = hex_nibble_to_int(record[DICT_LANG_OFFSET]);
+    int lang_lo = hex_nibble_to_int(record[DICT_LANG_OFFSET + 1]);
+    if (lang_hi < 0 || lang_lo < 0) return false;
+    if (language_id_out) {
+        *language_id_out = (uint8_t)((lang_hi << 4) | lang_lo);
+    }
+
     char raw_word[DICT_WORD_SIZE + 1];
-    memcpy(raw_word, &record[DICT_HEX_FIELD_CHARS], DICT_WORD_SIZE);
+    memcpy(raw_word, &record[DICT_WORD_OFFSET], DICT_WORD_SIZE);
     raw_word[DICT_WORD_SIZE] = '\0';
 
     for (int i = DICT_WORD_SIZE - 1; i >= 0; i--) {
@@ -1133,18 +1450,139 @@ static bool dict_parse_record_line(const char *record, uint8_t *seq_out, char *w
     return true;
 }
 
+static bool dict_format_record_line(const uint8_t *seq, uint8_t language_id, const char *word, char *record_out) {
+    if (!seq || !word || !record_out) return false;
+
+    memset(record_out, ' ', DICT_RECORD_SIZE);
+
+    for (int i = 0; i < PHONEME_SEQ_LEN; i++) {
+        int pos = i * 3;
+        snprintf(&record_out[pos], 3, "%02X", seq[i]);
+        record_out[pos + 2] = ' ';
+    }
+
+    snprintf(&record_out[DICT_LANG_OFFSET], 3, "%02X", language_id);
+    record_out[DICT_LANG_OFFSET + DICT_LANG_ID_CHARS] = ' ';
+
+    size_t wlen = strnlen(word, DICT_WORD_SIZE);
+    memcpy(&record_out[DICT_WORD_OFFSET], word, wlen);
+    record_out[DICT_WORD_OFFSET + DICT_WORD_SIZE] = '\r';
+    record_out[DICT_WORD_OFFSET + DICT_WORD_SIZE + 1] = '\n';
+    return true;
+}
+
+static int dict_compare_record_keys(const char *record_a, const char *record_b) {
+    uint8_t seq_a[PHONEME_SEQ_LEN] = {0};
+    uint8_t seq_b[PHONEME_SEQ_LEN] = {0};
+    uint8_t lang_a = LANG_UNKNOWN;
+    uint8_t lang_b = LANG_UNKNOWN;
+    char word_a[DICT_WORD_SIZE + 1] = {0};
+    char word_b[DICT_WORD_SIZE + 1] = {0};
+
+    if (!dict_parse_record_line(record_a, seq_a, &lang_a, word_a, sizeof(word_a))) return 0;
+    if (!dict_parse_record_line(record_b, seq_b, &lang_b, word_b, sizeof(word_b))) return 0;
+
+    int seq_cmp = compare_seq_to_record(seq_a, seq_b);
+    if (seq_cmp != 0) return seq_cmp;
+
+    if (lang_a < lang_b) return -1;
+    if (lang_a > lang_b) return 1;
+
+    return strcasecmp_local(word_a, word_b);
+}
+
+static bool dict_read_record_at(FIL *dict, uint32_t index, char *record_out) {
+    if (!dict || !record_out) return false;
+
+    FSIZE_t offset = (FSIZE_t)index * (FSIZE_t)DICT_RECORD_SIZE;
+    UINT br = 0;
+    if (f_lseek(dict, offset) != FR_OK) return false;
+    if (f_read(dict, record_out, DICT_RECORD_SIZE, &br) != FR_OK || br < DICT_RECORD_SIZE) return false;
+    return true;
+}
+
+static bool dict_write_record_at(FIL *dict, uint32_t index, const char *record_in) {
+    if (!dict || !record_in) return false;
+
+    FSIZE_t offset = (FSIZE_t)index * (FSIZE_t)DICT_RECORD_SIZE;
+    UINT bw = 0;
+    if (f_lseek(dict, offset) != FR_OK) return false;
+    if (f_write(dict, record_in, DICT_RECORD_SIZE, &bw) != FR_OK || bw != DICT_RECORD_SIZE) return false;
+    return true;
+}
+
+static bool dict_insert_sorted_record(FIL *dict, const char *record_line) {
+    if (!dict || !record_line) return false;
+
+    UINT bw = 0;
+    FSIZE_t end = f_size(dict);
+    if (f_lseek(dict, end) != FR_OK) return false;
+    if (f_write(dict, record_line, DICT_RECORD_SIZE, &bw) != FR_OK || bw != DICT_RECORD_SIZE) return false;
+
+    uint32_t record_count = (uint32_t)(f_size(dict) / DICT_RECORD_SIZE);
+    if (record_count == 0) return false;
+
+    uint32_t current_index = record_count - 1;
+    char current_record[DICT_RECORD_SIZE + 1] = {0};
+    memcpy(current_record, record_line, DICT_RECORD_SIZE);
+
+    char prev_record[DICT_RECORD_SIZE + 1] = {0};
+
+    // Reverse bubble sort pass for the newly appended entry:
+    // swap backwards until ordering is correct for binary search.
+    while (current_index > 0) {
+        uint32_t prev_index = current_index - 1;
+        if (!dict_read_record_at(dict, prev_index, prev_record)) return false;
+
+        if (dict_compare_record_keys(prev_record, current_record) <= 0) {
+            break;
+        }
+
+        if (!dict_write_record_at(dict, prev_index, current_record)) return false;
+        if (!dict_write_record_at(dict, current_index, prev_record)) return false;
+
+        current_index = prev_index;
+    }
+
+    return true;
+}
+
+static bool dict_add_word_with_language(const uint8_t *seq, uint8_t language_id, const char *word) {
+    if (!sd_ready || !seq || !word || word[0] == '\0') return false;
+
+    FIL dict;
+    FRESULT res = f_open(&dict, "0:/microsd/Dictionary.dat", FA_READ | FA_WRITE | FA_OPEN_EXISTING);
+    if (res != FR_OK) return false;
+
+    char record_line[DICT_RECORD_SIZE + 1] = {0};
+    if (!dict_format_record_line(seq, language_id, word, record_line)) {
+        f_close(&dict);
+        return false;
+    }
+
+    bool ok = dict_insert_sorted_record(&dict, record_line);
+    f_close(&dict);
+    return ok;
+}
+
 static bool dict_lookup_word(const uint8_t *seq, char *word_out, size_t word_out_len) {
     if (!dict_ready || word_out_len < 2) return false;
 
-    // Record format: 15 two-digit hex values + spaces (45 chars) + 26-char word field + CRLF
+    // Record format: 15 hex values (45 chars) + 2-char language ID + space + 26-char word + CRLF
     // Dictionary.dat is sorted by phoneme sequence (binary search possible)
     // NewWords.dat is sequential (linear search required)
 
     char record[DICT_RECORD_SIZE + 1];
     uint8_t record_seq[PHONEME_SEQ_LEN];
     char record_word[DICT_WORD_SIZE + 1];
+    uint8_t record_lang = LANG_UNKNOWN;
     UINT br;
     FRESULT res;
+    uint8_t target_lang = LANG_UNKNOWN;
+    if (current_user.set && current_user.language[0] != '\0') {
+        uint8_t lang_id = language_id_from_name(current_user.language);
+        target_lang = lang_id;
+    }
 
     // First, search Dictionary.dat using binary search (Dictionary.dat is sorted).
     uint32_t record_count = (uint32_t)(f_size(&dict_file) / DICT_RECORD_SIZE);
@@ -1163,13 +1601,56 @@ static bool dict_lookup_word(const uint8_t *seq, char *word_out, size_t word_out
             if (res != FR_OK || br < DICT_RECORD_SIZE) break;
             record[DICT_RECORD_SIZE] = '\0';
 
-            if (!dict_parse_record_line(record, record_seq, record_word, sizeof(record_word))) {
+            if (!dict_parse_record_line(record, record_seq, &record_lang, record_word, sizeof(record_word))) {
                 break;
             }
 
             int cmp = compare_seq_to_record(seq, record_seq);
             if (cmp == 0) {
-                strncpy(word_out, record_word, word_out_len - 1);
+                if (record_lang == target_lang) {
+                    strncpy(word_out, record_word, word_out_len - 1);
+                    word_out[word_out_len - 1] = '\0';
+                    return true;
+                }
+
+                char fallback_word[DICT_WORD_SIZE + 1];
+                strncpy(fallback_word, record_word, sizeof(fallback_word) - 1);
+                fallback_word[sizeof(fallback_word) - 1] = '\0';
+
+                bool exact_lang_found = false;
+
+                for (int32_t left = mid - 1; left >= low; left--) {
+                    FSIZE_t left_offset = (FSIZE_t)left * (FSIZE_t)DICT_RECORD_SIZE;
+                    if (f_lseek(&dict_file, left_offset) != FR_OK) break;
+                    if (f_read(&dict_file, record, DICT_RECORD_SIZE, &br) != FR_OK || br < DICT_RECORD_SIZE) break;
+                    record[DICT_RECORD_SIZE] = '\0';
+                    if (!dict_parse_record_line(record, record_seq, &record_lang, record_word, sizeof(record_word))) break;
+                    if (compare_seq_to_record(seq, record_seq) != 0) break;
+                    if (record_lang == target_lang) {
+                        strncpy(word_out, record_word, word_out_len - 1);
+                        word_out[word_out_len - 1] = '\0';
+                        return true;
+                    }
+                }
+
+                for (int32_t right = mid + 1; right <= high; right++) {
+                    FSIZE_t right_offset = (FSIZE_t)right * (FSIZE_t)DICT_RECORD_SIZE;
+                    if (f_lseek(&dict_file, right_offset) != FR_OK) break;
+                    if (f_read(&dict_file, record, DICT_RECORD_SIZE, &br) != FR_OK || br < DICT_RECORD_SIZE) break;
+                    record[DICT_RECORD_SIZE] = '\0';
+                    if (!dict_parse_record_line(record, record_seq, &record_lang, record_word, sizeof(record_word))) break;
+                    if (compare_seq_to_record(seq, record_seq) != 0) break;
+                    if (record_lang == target_lang) {
+                        exact_lang_found = true;
+                        strncpy(word_out, record_word, word_out_len - 1);
+                        word_out[word_out_len - 1] = '\0';
+                        break;
+                    }
+                }
+
+                if (exact_lang_found) return true;
+
+                strncpy(word_out, fallback_word, word_out_len - 1);
                 word_out[word_out_len - 1] = '\0';
                 return true;
             }
@@ -1195,11 +1676,11 @@ static bool dict_lookup_word(const uint8_t *seq, char *word_out, size_t word_out
         if (res != FR_OK || br < DICT_RECORD_SIZE) break;
         record[DICT_RECORD_SIZE] = '\0';
 
-        if (!dict_parse_record_line(record, record_seq, record_word, sizeof(record_word))) {
+        if (!dict_parse_record_line(record, record_seq, &record_lang, record_word, sizeof(record_word))) {
             break;
         }
 
-        int match = (compare_seq_to_record(seq, record_seq) == 0);
+        int match = (compare_seq_to_record(seq, record_seq) == 0) && (record_lang == target_lang);
 
         if (match) {
             strncpy(word_out, record_word, word_out_len - 1);
@@ -1223,13 +1704,103 @@ static bool ensure_microsd_dir(void) {
 }
 
 static bool nn_parse_index(const char *name, uint8_t *index_out) {
-    const char *prefix = "NNdata_";
+    const char *prefix = "RecognizerANN";
     size_t len = strlen(name);
-    if (len != 13) return false; // NNdata_XX.dat
-    if (strncmp(name, prefix, 7) != 0) return false;
-    if (name[9] != '.' || name[10] != 'd' || name[11] != 'a' || name[12] != 't') return false;
-    if (name[7] < '0' || name[7] > '9' || name[8] < '0' || name[8] > '9') return false;
-    *index_out = (uint8_t)((name[7] - '0') * 10 + (name[8] - '0'));
+    if (len != 19) return false; // RecognizerANNXX.dat
+    if (strncmp(name, prefix, 13) != 0) return false;
+    if (name[15] != '.' || name[16] != 'd' || name[17] != 'a' || name[18] != 't') return false;
+    if (name[13] < '0' || name[13] > '9' || name[14] < '0' || name[14] > '9') return false;
+    *index_out = (uint8_t)((name[13] - '0') * 10 + (name[14] - '0'));
+    return true;
+}
+
+static bool nn_version_from_path(const char *path, uint8_t *version_out) {
+    if (!path || !version_out) return false;
+    const char *name = strrchr(path, '/');
+    name = name ? (name + 1) : path;
+    return nn_parse_index(name, version_out);
+}
+
+static void ann_version_sort_asc(uint8_t *values, uint8_t count) {
+    if (!values || count < 2) return;
+    for (uint8_t i = 0; i < count; i++) {
+        for (uint8_t j = (uint8_t)(i + 1); j < count; j++) {
+            if (values[j] < values[i]) {
+                uint8_t t = values[i];
+                values[i] = values[j];
+                values[j] = t;
+            }
+        }
+    }
+}
+
+static bool ann_scan_saved_versions(uint8_t *versions_out, uint8_t *count_out) {
+    if (!versions_out || !count_out) return false;
+    *count_out = 0;
+    if (!ensure_microsd_dir()) return false;
+
+    DIR dir;
+    FILINFO fno;
+    if (f_opendir(&dir, "0:/microsd") != FR_OK) return false;
+
+    while (f_readdir(&dir, &fno) == FR_OK && fno.fname[0] != 0) {
+        const char *name = fno.fname[0] ? fno.fname : fno.altname;
+        uint8_t version = 0;
+        if (nn_parse_index(name, &version)) {
+            bool exists = false;
+            for (uint8_t i = 0; i < *count_out; i++) {
+                if (versions_out[i] == version) {
+                    exists = true;
+                    break;
+                }
+            }
+            if (!exists && *count_out < ANN_VERSION_MAX) {
+                versions_out[*count_out] = version;
+                (*count_out)++;
+            }
+        }
+    }
+
+    f_closedir(&dir);
+    ann_version_sort_asc(versions_out, *count_out);
+    return true;
+}
+
+static bool ann_path_from_version(uint8_t version, char *path_out, size_t path_len) {
+    if (!path_out || path_len == 0 || version > 99) return false;
+    snprintf(path_out, path_len, "0:/microsd/RecognizerANN%02u.dat", (unsigned)version);
+    return true;
+}
+
+static bool load_ann_to_all_stage2(uint8_t version) {
+    char path[80];
+    if (!ann_path_from_version(version, path, sizeof(path))) return false;
+
+    bool ok = true;
+    for (uint8_t i = 0; i < STAGE2_COUNT; i++) {
+        uint8_t addr = (uint8_t)(STAGE2_BASE_ADDR + i);
+        menu_render_load_ann_progress(version, (uint8_t)(i + 1), STAGE2_COUNT);
+
+        if (!stage2_load_nn_from_sd(addr, path)) {
+            ok = false;
+        }
+    }
+
+    return ok;
+}
+
+static bool load_ann_menu_start(void) {
+    ann_version_count = 0;
+    ann_version_index = 0;
+
+    if (!ann_scan_saved_versions(ann_versions, &ann_version_count)) {
+        return false;
+    }
+
+    if (ann_version_count > 0) {
+        ann_version_index = (uint8_t)(ann_version_count - 1);
+    }
+
     return true;
 }
 
@@ -1256,7 +1827,7 @@ static bool nn_next_filename(char *path_out, size_t path_len) {
 
     uint8_t next = any ? (uint8_t)(max_index + 1) : 0;
     if (next > 99) return false;
-    snprintf(path_out, path_len, "0:/microsd/NNdata_%02u.dat", next);
+    snprintf(path_out, path_len, "0:/microsd/RecognizerANN%02u.dat", next);
     return true;
 }
 
@@ -1326,6 +1897,10 @@ static bool generate_sample_words(void) {
     const int phoneme_max = 0x2C;
     const int phoneme_count_total = phoneme_max - phoneme_min + 1;
     uint8_t counts[40] = {0};
+    uint8_t target_language_id = LANG_UNKNOWN;
+    if (current_user.set && current_user.language[0] != '\0') {
+        target_language_id = language_id_from_name(current_user.language);
+    }
 
     bool progress = true;
     while (progress) {
@@ -1338,15 +1913,18 @@ static bool generate_sample_words(void) {
         UINT br = 0;
         char record[DICT_RECORD_SIZE + 1];
         uint8_t parsed_seq[PHONEME_SEQ_LEN];
+        uint8_t parsed_lang = LANG_UNKNOWN;
         char parsed_word[DICT_WORD_SIZE + 1];
         while (1) {
             res = f_read(&dict, record, DICT_RECORD_SIZE, &br);
             if (res != FR_OK || br < DICT_RECORD_SIZE) break;
             record[DICT_RECORD_SIZE] = '\0';
 
-            if (!dict_parse_record_line(record, parsed_seq, parsed_word, sizeof(parsed_word))) {
+            if (!dict_parse_record_line(record, parsed_seq, &parsed_lang, parsed_word, sizeof(parsed_word))) {
                 continue;
             }
+
+            if (parsed_lang != target_language_id) continue;
 
             int pcount = phoneme_count(parsed_seq);
             if (pcount == 0 || pcount > MAX_PHONEMES_PER_WORD) continue;
@@ -1415,11 +1993,11 @@ static bool dict_merge_new_words(void) {
         return true;  // Not an error, just nothing to do
     }
 
-    // Open Dictionary.dat in append mode
+    // Open Dictionary.dat in read/write mode for sorted insertion
     FIL dict;
-    res = f_open(&dict, "0:/microsd/Dictionary.dat", FA_WRITE | FA_OPEN_APPEND);
+    res = f_open(&dict, "0:/microsd/Dictionary.dat", FA_READ | FA_WRITE | FA_OPEN_EXISTING);
     if (res != FR_OK) {
-        printf("ERROR: Failed to open Dictionary.dat for append (code %d)\\n", res);
+        printf("ERROR: Failed to open Dictionary.dat for update (code %d)\\n", res);
         return false;
     }
 
@@ -1433,17 +2011,16 @@ static bool dict_merge_new_words(void) {
     }
 
     uint8_t record[DICT_RECORD_SIZE];
-    UINT br, bw;
+    UINT br;
     uint32_t merged_count = 0;
 
-    // Copy all records from NewWords.dat to Dictionary.dat
+    // Insert all NewWords.dat records into Dictionary.dat with reverse-bubble sorted placement
     while (1) {
         res = f_read(&newwords, record, DICT_RECORD_SIZE, &br);
         if (res != FR_OK || br < DICT_RECORD_SIZE) break;
 
-        res = f_write(&dict, record, DICT_RECORD_SIZE, &bw);
-        if (res != FR_OK || bw != DICT_RECORD_SIZE) {
-            printf("ERROR: Failed to write merged record\\n");
+        if (!dict_insert_sorted_record(&dict, (const char *)record)) {
+            printf("ERROR: Failed to insert merged record in sorted order\\n");
             f_close(&dict);
             f_close(&newwords);
             return false;
@@ -1485,7 +2062,7 @@ static uint8_t load_unrecognised_preview(void) {
         }
         record[DICT_RECORD_SIZE] = '\0';
 
-        if (!dict_parse_record_line(record, parsed_seq, parsed_word, sizeof(parsed_word))) {
+        if (!dict_parse_record_line(record, parsed_seq, NULL, parsed_word, sizeof(parsed_word))) {
             continue;
         }
 
@@ -1515,7 +2092,7 @@ static bool dict_target_from_word(const char *word, uint8_t *target_out) {
         if (f_read(&dict, record, DICT_RECORD_SIZE, &br) != FR_OK || br < DICT_RECORD_SIZE) break;
         record[DICT_RECORD_SIZE] = '\0';
 
-        if (!dict_parse_record_line(record, parsed_seq, parsed_word, sizeof(parsed_word))) {
+        if (!dict_parse_record_line(record, parsed_seq, NULL, parsed_word, sizeof(parsed_word))) {
             continue;
         }
 
@@ -1534,6 +2111,73 @@ static bool dict_target_from_word(const char *word, uint8_t *target_out) {
 
     f_close(&dict);
     return found;
+}
+
+static bool dict_seq_from_word(const char *word, uint8_t *seq_out) {
+    if (!dict_ready || !word || !seq_out) return false;
+
+    FIL dict;
+    if (f_open(&dict, "0:/microsd/Dictionary.dat", FA_READ | FA_OPEN_EXISTING) != FR_OK) return false;
+
+    UINT br = 0;
+    char record[DICT_RECORD_SIZE + 1];
+    uint8_t parsed_seq[PHONEME_SEQ_LEN];
+    char parsed_word[DICT_WORD_SIZE + 1];
+    bool found = false;
+
+    while (1) {
+        if (f_read(&dict, record, DICT_RECORD_SIZE, &br) != FR_OK || br < DICT_RECORD_SIZE) break;
+        record[DICT_RECORD_SIZE] = '\0';
+
+        if (!dict_parse_record_line(record, parsed_seq, NULL, parsed_word, sizeof(parsed_word))) {
+            continue;
+        }
+
+        if (strcasecmp_local(parsed_word, word) == 0) {
+            memcpy(seq_out, parsed_seq, PHONEME_SEQ_LEN);
+            found = true;
+            break;
+        }
+    }
+
+    f_close(&dict);
+    return found;
+}
+
+static uint8_t build_expected_phoneme_list(const uint8_t *seq, uint8_t *expected_out, uint8_t expected_max) {
+    if (!seq || !expected_out || expected_max == 0) return 0;
+
+    uint8_t count = 0;
+    for (uint8_t i = 0; i < PHONEME_SEQ_LEN && count < expected_max; i++) {
+        uint8_t id = seq[i];
+        if (id >= 0x05 && id <= 0x2C) {
+            expected_out[count++] = id;
+        }
+    }
+    return count;
+}
+
+static uint8_t sequence_order_match_percent(const uint8_t *expected,
+                                            uint8_t expected_count,
+                                            const uint8_t *observed,
+                                            uint16_t observed_count) {
+    if (!expected || expected_count == 0) return 0;
+    if (!observed || observed_count == 0) return 0;
+
+    uint8_t matched = 0;
+    uint16_t obs_index = 0;
+
+    for (uint8_t exp_index = 0; exp_index < expected_count; exp_index++) {
+        uint8_t target = expected[exp_index];
+        while (obs_index < observed_count && observed[obs_index] != target) {
+            obs_index++;
+        }
+        if (obs_index >= observed_count) break;
+        matched++;
+        obs_index++;
+    }
+
+    return (uint8_t)((matched * 100u) / expected_count);
 }
 
 static bool stage2_write_reg8(uint8_t addr, uint8_t reg, uint8_t value) {
@@ -1599,15 +2243,14 @@ static bool stage2_read_input(uint8_t addr, uint8_t *dst) {
 // ==============================
 // Training state machine
 // ==============================
-static FIL sample_file;
-static bool sample_file_open = false;
-static char current_word[32];
-static uint8_t capture_buffer[CAPTURE_FRAMES][INPUT_NEURONS];
+static char training_active_word[DICT_WORD_SIZE + 1];
+static uint8_t capture_buffer[CAPTURE_FRAMES][CAPTURE_FRAME_BYTES];
 static uint16_t capture_index = 0;
 
 static uint8_t peak_window[PEAK_WINDOW_FRAMES];
 static uint16_t peak_sum = 0;
 static uint16_t peak_pos = 0;
+static bool speech_started = false;
 
 static void peak_window_reset(void) {
     memset(peak_window, 0, sizeof(peak_window));
@@ -1617,65 +2260,35 @@ static void peak_window_reset(void) {
 
 static uint8_t compute_peak(const uint8_t *frame) {
     uint8_t peak = 0;
-    for (int i = 0; i < INPUT_NEURONS; i++) {
+    for (int i = 0; i < CAPTURE_FRAME_BYTES; i++) {
         if (frame[i] > peak) peak = frame[i];
     }
     return peak;
 }
 
-static bool sample_words_open(void) {
-    if (sample_file_open) return true;
-    FRESULT res = f_open(&sample_file, "0:/microsd/SampleWords.txt", FA_READ | FA_OPEN_EXISTING);
-    if (res != FR_OK) return false;
-    sample_file_open = true;
-    return true;
-}
-
-static bool sample_words_next(char *word_out, size_t len) {
-    if (!sample_file_open) return false;
-    char line[64];
-    while (f_gets(line, sizeof(line), &sample_file)) {
-        size_t l = strcspn(line, "\r\n");
-        line[l] = '\0';
-        if (l > 0) {
-            strncpy(word_out, line, len - 1);
-            word_out[len - 1] = '\0';
-            return true;
-        }
-    }
-    return false;
-}
-
-static bool save_capture_to_sd(const user_profile_t *user, const char *word) {
+static bool save_capture_to_sd(const user_profile_t *user, const char *word, uint16_t frames) {
     if (!user || !user->set) return false;
     if (!user_folder_prepare(user)) return false;
+    if (frames == 0 || frames > CAPTURE_FRAMES) return false;
 
     char path[160];
-    snprintf(path, sizeof(path), "0:/microsd/%s/%s.cap", user->username, word);
-
-    FILINFO fno;
-    if (f_stat(path, &fno) == FR_OK) {
-        for (int i = 1; i < 100; i++) {
-            snprintf(path, sizeof(path), "0:/microsd/%s/%s_%02d.cap", user->username, word, i);
-            if (f_stat(path, &fno) != FR_OK) break;
-        }
-    }
+    snprintf(path, sizeof(path), "0:/microsd/%s/%s.dat", user->username, word);
 
     FIL file;
-    FRESULT res = f_open(&file, path, FA_WRITE | FA_CREATE_NEW);
+    FRESULT res = f_open(&file, path, FA_WRITE | FA_CREATE_ALWAYS);
     if (res != FR_OK) return false;
 
     UINT bw = 0;
-    uint8_t header[8] = {'C','A','P','0', (uint8_t)INPUT_NEURONS, 0, (uint8_t)CAPTURE_FRAMES, 0};
+    uint8_t header[8] = {'C','A','P','0', (uint8_t)CAPTURE_FRAME_BYTES, 0, (uint8_t)frames, 0};
     res = f_write(&file, header, sizeof(header), &bw);
     if (res != FR_OK || bw != sizeof(header)) {
         f_close(&file);
         return false;
     }
 
-    for (uint16_t i = 0; i < CAPTURE_FRAMES; i++) {
-        res = f_write(&file, capture_buffer[i], INPUT_NEURONS, &bw);
-        if (res != FR_OK || bw != INPUT_NEURONS) {
+    for (uint16_t i = 0; i < frames; i++) {
+        res = f_write(&file, capture_buffer[i], CAPTURE_FRAME_BYTES, &bw);
+        if (res != FR_OK || bw != CAPTURE_FRAME_BYTES) {
             f_close(&file);
             return false;
         }
@@ -1686,22 +2299,60 @@ static bool save_capture_to_sd(const user_profile_t *user, const char *word) {
 }
 
 static void training_start(void) {
-    if (!sd_ready || !current_user.set) return;
-    if (!sample_words_open()) return;
+    if (!sd_ready || !current_user.set) {
+        training_words_loaded = false;
+        training_word_count = 0;
+        training_word_index = 0;
+        train_state = TRAIN_IDLE;
+        return;
+    }
 
-    train_state = TRAIN_SHOW_WORD;
+    training_words_loaded = training_words_load_for_current_user();
+    if (!training_words_loaded || training_word_count == 0) {
+        training_word_count = 0;
+        training_word_index = 0;
+    }
+
+    train_state = TRAIN_IDLE;
     peak_window_reset();
     capture_index = 0;
+    speech_started = false;
+    training_active_word[0] = '\0';
 }
 
 static void training_stop(void) {
-    if (sample_file_open) {
-        f_close(&sample_file);
-        sample_file_open = false;
-    }
+    uint8_t addr = (uint8_t)(STAGE2_BASE_ADDR + TRAIN_BEAM_INDEX);
+    stage2_write_reg16(addr, STAGE2_REG_CONTROL, 0x0000);
+    stage2_clear_input(addr);
+
     train_state = TRAIN_IDLE;
-    menu_state = MENU_SCREEN0;
-    menu_render_screen0();
+    capture_index = 0;
+    speech_started = false;
+    training_active_word[0] = '\0';
+}
+
+static bool training_begin_capture(void) {
+    if (!training_words_loaded || training_word_count == 0 || !current_user.set) return false;
+
+    uint8_t addr = (uint8_t)(STAGE2_BASE_ADDR + TRAIN_BEAM_INDEX);
+    if (!stage2_clear_input(addr)) return false;
+
+    strncpy(training_active_word, training_words[training_word_index], sizeof(training_active_word) - 1);
+    training_active_word[sizeof(training_active_word) - 1] = '\0';
+
+    peak_window_reset();
+    capture_index = 0;
+    speech_started = false;
+    train_state = TRAIN_WAIT_TRIGGER;
+    menu_render_training_menu();
+    return true;
+}
+
+static void training_abort_to_main(void) {
+    training_stop();
+    menu_state = MENU_MAIN;
+    menu_main_page = 1;
+    menu_render_main();
 }
 
 static void training_tick(void) {
@@ -1726,63 +2377,53 @@ static void training_tick(void) {
     switch (train_state) {
         case TRAIN_IDLE:
             break;
-        case TRAIN_SHOW_WORD: {
-            if (!sample_words_next(current_word, sizeof(current_word))) {
-                lcd_clear();
-                lcd_set_cursor(0, 0);
-                lcd_print("Training Done");
-                training_stop();
-                break;
-            }
-
-            stage2_clear_input(addr);
-            lcd_clear();
-            lcd_set_cursor(0, 0);
-            lcd_print("Speak word:");
-            lcd_set_cursor(0, 1);
-            lcd_print(current_word);
-
-            peak_window_reset();
-            capture_index = 0;
-            train_state = TRAIN_WAIT_TRIGGER;
-            break;
-        }
         case TRAIN_WAIT_TRIGGER:
             if (peak > avg_peak) {
-                capture_index = 0;
+                speech_started = true;
+                if (capture_index < CAPTURE_FRAMES) {
+                    memcpy(capture_buffer[capture_index], frame, CAPTURE_FRAME_BYTES);
+                    capture_index++;
+                }
                 train_state = TRAIN_CAPTURE;
             }
             break;
         case TRAIN_CAPTURE:
             if (capture_index < CAPTURE_FRAMES) {
-                memcpy(capture_buffer[capture_index], frame, INPUT_NEURONS);
+                memcpy(capture_buffer[capture_index], frame, CAPTURE_FRAME_BYTES);
                 capture_index++;
             }
-            if (capture_index >= CAPTURE_FRAMES) {
+
+            bool spoken_done = (speech_started && capture_index >= TRAIN_MIN_SPOKEN_FRAMES && peak <= avg_peak);
+            if (spoken_done || capture_index >= CAPTURE_FRAMES) {
                 stage2_write_reg16(addr, STAGE2_REG_CONTROL, STAGE2_CTRL_FREEZE_PAUSE);
                 train_state = TRAIN_SAVE;
             }
             break;
         case TRAIN_SAVE:
-            if (save_capture_to_sd(&current_user, current_word)) {
+            if (save_capture_to_sd(&current_user, training_active_word, capture_index)) {
+                stage2_clear_input(addr);
                 stage2_write_reg16(addr, STAGE2_REG_CONTROL, 0x0000);
-                train_state = TRAIN_NEXT;
+                train_state = TRAIN_IDLE;
+                menu_render_training_menu();
             } else {
+                stage2_clear_input(addr);
                 stage2_write_reg16(addr, STAGE2_REG_CONTROL, 0x0000);
-                training_stop();
+                train_state = TRAIN_IDLE;
+                menu_render_training_menu();
             }
-            break;
-        case TRAIN_NEXT:
-            train_state = TRAIN_SHOW_WORD;
             break;
         default:
             break;
     }
 }
 
-static bool stage2_save_nn_to_sd(uint8_t addr, char *path_out, size_t path_len) {
+static bool stage2_save_nn_to_sd(uint8_t addr, char *path_out, size_t path_len, bool show_progress) {
     if (!sd_ready) return false;
     if (!nn_next_filename(path_out, path_len)) return false;
+
+    uint8_t version = 0;
+    nn_version_from_path(path_out, &version);
+    if (show_progress) menu_render_save_ann_progress(version, "Preparing", 0);
 
     if (!stage2_write_reg16(addr, STAGE2_REG_CONTROL, STAGE2_CTRL_FREEZE_PAUSE)) return false;
     sleep_ms(5);
@@ -1790,12 +2431,16 @@ static bool stage2_save_nn_to_sd(uint8_t addr, char *path_out, size_t path_len) 
     uint8_t buffer[NN_TOTAL_SIZE];
     uint8_t *ptr = buffer;
 
+    if (show_progress) menu_render_save_ann_progress(version, "Read W1", 20);
     if (!stage2_page_read(addr, STAGE2_PAGE_W1, 0, W1_SIZE, ptr)) goto cleanup;
     ptr += W1_SIZE;
+    if (show_progress) menu_render_save_ann_progress(version, "Read B1", 40);
     if (!stage2_page_read(addr, STAGE2_PAGE_B1, 0, B1_SIZE, ptr)) goto cleanup;
     ptr += B1_SIZE;
+    if (show_progress) menu_render_save_ann_progress(version, "Read W2", 60);
     if (!stage2_page_read(addr, STAGE2_PAGE_W2, 0, W2_SIZE, ptr)) goto cleanup;
     ptr += W2_SIZE;
+    if (show_progress) menu_render_save_ann_progress(version, "Read B2", 80);
     if (!stage2_page_read(addr, STAGE2_PAGE_B2, 0, B2_SIZE, ptr)) goto cleanup;
 
     FIL file;
@@ -1818,6 +2463,7 @@ static bool stage2_save_nn_to_sd(uint8_t addr, char *path_out, size_t path_len) 
     f_close(&file);
     if (res != FR_OK || bw != NN_TOTAL_SIZE) goto cleanup;
 
+    if (show_progress) menu_render_save_ann_progress(version, "Saved", 100);
     stage2_write_reg16(addr, STAGE2_REG_CONTROL, 0x0000);
     return true;
 
@@ -2046,6 +2692,7 @@ static void handle_command(const char *line) {
             current_user.gender[sizeof(current_user.gender) - 1] = '\0';
             strncpy(current_user.full_name, fullname, sizeof(current_user.full_name) - 1);
             current_user.full_name[sizeof(current_user.full_name) - 1] = '\0';
+            current_user.user_id = 0;
             current_user.age = (uint8_t)atoi(age_str);
             current_user.set = true;
 
@@ -2095,7 +2742,222 @@ static bool stage2_trigger_backprop(uint8_t addr) {
     return stage2_write_reg16(addr, STAGE2_REG_CONTROL, STAGE2_CTRL_BACKPROP);
 }
 
-static bool run_backprop_on_file(uint8_t addr, const char *path, uint8_t target_id) {
+static bool stage2_read_training_metrics(uint8_t addr,
+                                         uint8_t *max_id_out,
+                                         uint8_t *max_val_out,
+                                         uint8_t *target_val_out,
+                                         uint8_t *user_id_out,
+                                         uint8_t *user_val_out,
+                                         uint8_t *female_val_out,
+                                         uint8_t *male_val_out) {
+    uint8_t max_id = 0;
+    uint8_t max_val = 0;
+    uint8_t target_val = 0;
+    uint8_t user_id = 0;
+    uint8_t user_val = 0;
+    uint8_t female_val = 0;
+    uint8_t male_val = 0;
+
+    if (!stage2_read_reg8(addr, STAGE2_REG_LAST_MAX_ID, &max_id)) return false;
+    if (!stage2_read_reg8(addr, STAGE2_REG_LAST_MAX_VAL, &max_val)) return false;
+    if (!stage2_read_reg8(addr, STAGE2_REG_LAST_TARGET_VAL, &target_val)) return false;
+    if (!stage2_read_reg8(addr, STAGE2_REG_LAST_USER_ID, &user_id)) return false;
+    if (!stage2_read_reg8(addr, STAGE2_REG_LAST_USER_VAL, &user_val)) return false;
+    if (!stage2_read_reg8(addr, STAGE2_REG_LAST_FEMALE_VAL, &female_val)) return false;
+    if (!stage2_read_reg8(addr, STAGE2_REG_LAST_MALE_VAL, &male_val)) return false;
+
+    if (max_id_out) *max_id_out = max_id;
+    if (max_val_out) *max_val_out = max_val;
+    if (target_val_out) *target_val_out = target_val;
+    if (user_id_out) *user_id_out = user_id;
+    if (user_val_out) *user_val_out = user_val;
+    if (female_val_out) *female_val_out = female_val;
+    if (male_val_out) *male_val_out = male_val;
+    return true;
+}
+
+static bool i2c_read_stream_reg(uint8_t addr, uint8_t reg, uint8_t *dst, uint16_t len) {
+    if (!dst || len == 0) return false;
+    if (i2c_write_blocking(I2C_STAGE2_PORT, addr, &reg, 1, true) != 1) return false;
+    return i2c_read_blocking(I2C_STAGE2_PORT, addr, dst, len, false) == len;
+}
+
+static bool stage4_set_image_line_ptr(uint16_t line) {
+    if (line >= STAGE4_IMAGE_LINES) line = 0;
+    return stage2_write_reg16(STAGE4_ADDR, STAGE4_REG_IMAGE_LINE_PTR, line);
+}
+
+static bool stage4_read_image_line(uint16_t line, uint8_t *line_out) {
+    if (!line_out) return false;
+    if (!stage4_set_image_line_ptr(line)) return false;
+    return i2c_read_stream_reg(STAGE4_ADDR, STAGE4_REG_IMAGE_DATA, line_out, STAGE4_IMAGE_BINS);
+}
+
+static bool stage4_generate_image(uint8_t phoneme_id) {
+    if (!stage2_write_reg8(STAGE4_ADDR, STAGE4_REG_GEN_PHONEME, phoneme_id)) return false;
+    if (!stage2_write_reg8(STAGE4_ADDR, STAGE4_REG_TRAIN_TARGET, phoneme_id)) return false;
+    return stage2_write_reg8(STAGE4_ADDR,
+                             STAGE4_REG_GEN_COMMAND,
+                             (uint8_t)(STAGE4_CMD_RESET_IMAGE_PTR | STAGE4_CMD_GENERATE_IMAGE));
+}
+
+static bool stage4_backprop_step(uint8_t phoneme_id, uint8_t feedback_score) {
+    if (!stage2_write_reg8(STAGE4_ADDR, STAGE4_REG_TRAIN_TARGET, phoneme_id)) return false;
+    if (!stage2_write_reg8(STAGE4_ADDR, STAGE4_REG_TRAIN_FEEDBACK, feedback_score)) return false;
+    return stage2_write_reg8(STAGE4_ADDR, STAGE4_REG_GEN_COMMAND, STAGE4_CMD_BACKPROP_STEP);
+}
+
+static bool stage4_capture_image(uint8_t image[STAGE4_IMAGE_LINES][STAGE4_IMAGE_BINS]) {
+    for (uint16_t line = 0; line < STAGE4_IMAGE_LINES; line++) {
+        if (!stage4_read_image_line(line, image[line])) return false;
+    }
+    return true;
+}
+
+static bool stage2_score_generated_image(uint8_t addr,
+                                         uint8_t target_id,
+                                         uint8_t image[STAGE4_IMAGE_LINES][STAGE4_IMAGE_BINS],
+                                         uint8_t *best_target_val_out,
+                                         uint8_t *best_max_id_out) {
+    uint8_t best_target_val = 0;
+    uint8_t best_max_id = 0;
+    uint8_t nn_frame[INPUT_NEURONS] = {0};
+
+    if (!stage2_set_target(addr, target_id)) return false;
+
+    for (uint16_t line = 0; line < STAGE4_IMAGE_LINES; line++) {
+        memcpy(nn_frame, image[line], STAGE4_IMAGE_BINS);
+        nn_frame[STAGE4_IMAGE_BINS] = 0;
+
+        if (!stage2_page_write(addr, STAGE2_PAGE_INPUT, 0, INPUT_NEURONS, nn_frame)) return false;
+        sleep_ms(2);
+
+        uint8_t max_id = 0;
+        uint8_t max_val = 0;
+        uint8_t target_val = 0;
+        uint8_t user_id = 0;
+        uint8_t user_val = 0;
+        uint8_t female_val = 0;
+        uint8_t male_val = 0;
+        if (!stage2_read_training_metrics(addr,
+                                          &max_id,
+                                          &max_val,
+                                          &target_val,
+                                          &user_id,
+                                          &user_val,
+                                          &female_val,
+                                          &male_val)) {
+            continue;
+        }
+
+        if (target_val > best_target_val) {
+            best_target_val = target_val;
+            best_max_id = max_id;
+        }
+    }
+
+    if (best_target_val_out) *best_target_val_out = best_target_val;
+    if (best_max_id_out) *best_max_id_out = best_max_id;
+    return true;
+}
+
+static bool run_speech_generator_training(void) {
+    uint8_t stage2_addr = (uint8_t)(STAGE2_BASE_ADDR + TRAIN_BEAM_INDEX);
+    uint8_t image[STAGE4_IMAGE_LINES][STAGE4_IMAGE_BINS];
+
+    bool freeze_ok = stage2_write_reg16(stage2_addr, STAGE2_REG_CONTROL, 0x0002);
+    if (!freeze_ok) {
+        lcd_set_status("Status: SG freeze err");
+        return false;
+    }
+
+    bool overall_ok = true;
+    for (uint8_t phoneme = 0x05; phoneme <= 0x2C; phoneme++) {
+        uint8_t best_target = 0;
+        uint8_t best_id = 0;
+        bool phoneme_ok = false;
+
+        for (uint8_t epoch = 0; epoch < STAGE4_TRAIN_MAX_EPOCHS; epoch++) {
+            lcd_clear();
+            lcd_print_padded_line(0, "SpeechGen Train");
+            char line1[21];
+            snprintf(line1, sizeof(line1), "Phoneme:0x%02X", (unsigned)phoneme);
+            lcd_print_padded_line(1, line1);
+            char line2[21];
+            snprintf(line2, sizeof(line2), "Epoch:%u/%u", (unsigned)(epoch + 1), (unsigned)STAGE4_TRAIN_MAX_EPOCHS);
+            lcd_print_padded_line(2, line2);
+            lcd_print_padded_line(3, "Gen->Eval->Adjust");
+
+            if (!stage4_generate_image(phoneme)) {
+                overall_ok = false;
+                break;
+            }
+
+            if (!stage4_capture_image(image)) {
+                overall_ok = false;
+                break;
+            }
+
+            uint8_t target_val = 0;
+            uint8_t max_id = 0;
+            if (!stage2_score_generated_image(stage2_addr, phoneme, image, &target_val, &max_id)) {
+                overall_ok = false;
+                break;
+            }
+
+            if (target_val > best_target) {
+                best_target = target_val;
+                best_id = max_id;
+            }
+
+            uint8_t target_pct = (uint8_t)((target_val * 100u) / 255u);
+            if (target_pct >= 80) {
+                phoneme_ok = true;
+                break;
+            }
+
+            if (!stage4_backprop_step(phoneme, target_val)) {
+                overall_ok = false;
+                break;
+            }
+            sleep_ms(5);
+        }
+
+        char log_line[160];
+        snprintf(log_line,
+                 sizeof(log_line),
+                 "SGTRAIN phoneme=0x%02X result=%s target=%u%% max_id=0x%02X",
+                 (unsigned)phoneme,
+                 phoneme_ok ? "PASS" : "FAIL",
+                 (unsigned)((best_target * 100u) / 255u),
+                 (unsigned)best_id);
+        ann_log_emit(current_user.username, log_line);
+
+        if (!phoneme_ok) {
+            overall_ok = false;
+        }
+    }
+
+    stage2_write_reg16(stage2_addr, STAGE2_REG_CONTROL, 0x0000);
+    return overall_ok;
+}
+
+static bool run_backprop_on_file(uint8_t addr,
+                                 const char *path,
+                                 const char *word_label,
+                                 const char *log_username,
+                                 uint8_t target_id,
+                                 const uint8_t *expected_seq,
+                                 uint8_t expected_seq_count,
+                                 uint8_t expected_user_id,
+                                 bool expected_gender_male,
+                                 uint8_t *best_target_conf_out,
+                                 uint8_t *best_phoneme_order_out,
+                                 bool *gender_pass_out,
+                                 bool *user_pass_out,
+                                 uint8_t *last_max_id_out,
+                                 uint8_t *last_user_id_out,
+                                 uint8_t *epochs_used_out) {
     FIL file;
     if (f_open(&file, path, FA_READ | FA_OPEN_EXISTING) != FR_OK) return false;
 
@@ -2105,80 +2967,319 @@ static bool run_backprop_on_file(uint8_t addr, const char *path, uint8_t target_
         f_close(&file);
         return false;
     }
-    if (memcmp(header, "CAP0", 4) != 0 || header[4] != INPUT_NEURONS) {
+    if (memcmp(header, "CAP0", 4) != 0 || header[4] != CAPTURE_FRAME_BYTES) {
         f_close(&file);
         return false;
     }
 
     uint8_t frames = header[6];
-    uint8_t frame[INPUT_NEURONS];
-    for (uint8_t i = 0; i < frames; i++) {
-        if (f_read(&file, frame, INPUT_NEURONS, &br) != FR_OK || br != INPUT_NEURONS) {
+    if (frames == 0) {
+        f_close(&file);
+        return false;
+    }
+
+    uint8_t captured_frame[CAPTURE_FRAME_BYTES];
+    uint8_t nn_frame[INPUT_NEURONS];
+    uint8_t best_target_conf = 0;
+    uint8_t best_phoneme_order = 0;
+    uint8_t last_max_id = 0;
+    uint8_t last_user_id = 0;
+    uint8_t epochs_used = 0;
+    bool gender_pass = false;
+    bool user_pass = false;
+
+    uint8_t expected_local[PHONEME_SEQ_LEN] = {0};
+    if (expected_seq && expected_seq_count > 0) {
+        if (expected_seq_count > PHONEME_SEQ_LEN) expected_seq_count = PHONEME_SEQ_LEN;
+        memcpy(expected_local, expected_seq, expected_seq_count);
+    }
+
+    for (uint8_t epoch = 0; epoch < STAGE2_ANN_MAX_EPOCHS; epoch++) {
+        if (f_lseek(&file, sizeof(header)) != FR_OK) {
             f_close(&file);
             return false;
         }
-        if (!stage2_page_write(addr, STAGE2_PAGE_INPUT, 0, INPUT_NEURONS, frame)) {
-            f_close(&file);
-            return false;
+
+        uint8_t epoch_best_target_conf = 0;
+        uint8_t epoch_best_gender_val = 0;
+        uint8_t epoch_best_user_val = 0;
+        uint8_t observed_seq[CAPTURE_FRAMES] = {0};
+        uint16_t observed_count = 0;
+        uint8_t last_observed_id = 0;
+
+        for (uint8_t i = 0; i < frames; i++) {
+            if (f_read(&file, captured_frame, CAPTURE_FRAME_BYTES, &br) != FR_OK || br != CAPTURE_FRAME_BYTES) {
+                f_close(&file);
+                return false;
+            }
+
+            memcpy(nn_frame, captured_frame, CAPTURE_FRAME_BYTES);
+            nn_frame[CAPTURE_FRAME_BYTES] = 0;
+
+            if (!stage2_page_write(addr, STAGE2_PAGE_INPUT, 0, INPUT_NEURONS, nn_frame)) {
+                f_close(&file);
+                return false;
+            }
+            if (!stage2_set_target(addr, target_id)) {
+                f_close(&file);
+                return false;
+            }
+            if (!stage2_trigger_backprop(addr)) {
+                f_close(&file);
+                return false;
+            }
+
+            sleep_ms(5);
+
+            uint8_t max_id = 0;
+            uint8_t max_val = 0;
+            uint8_t target_val = 0;
+            uint8_t user_id = 0;
+            uint8_t user_val = 0;
+            uint8_t female_val = 0;
+            uint8_t male_val = 0;
+            if (stage2_read_training_metrics(addr,
+                                             &max_id,
+                                             &max_val,
+                                             &target_val,
+                                             &user_id,
+                                             &user_val,
+                                             &female_val,
+                                             &male_val)) {
+                if (target_val > epoch_best_target_conf) {
+                    epoch_best_target_conf = target_val;
+                }
+                uint8_t gender_val = expected_gender_male ? male_val : female_val;
+                if (gender_val > epoch_best_gender_val) {
+                    epoch_best_gender_val = gender_val;
+                }
+                if (user_val > epoch_best_user_val) {
+                    epoch_best_user_val = user_val;
+                }
+
+                if (max_id >= 0x05 && max_id <= 0x2C) {
+                    if (observed_count == 0 || max_id != last_observed_id) {
+                        observed_seq[observed_count++] = max_id;
+                        last_observed_id = max_id;
+                    }
+                }
+
+                last_max_id = max_id;
+                last_user_id = user_id;
+            }
         }
-        stage2_set_target(addr, target_id);
-        stage2_trigger_backprop(addr);
-        sleep_ms(5);
+
+        uint8_t epoch_phoneme_order = sequence_order_match_percent(expected_local,
+                                                                   expected_seq_count,
+                                                                   observed_seq,
+                                                                   observed_count);
+
+        bool epoch_gender_ok = (epoch_best_gender_val >= STAGE2_CERTAINTY_THRESHOLD);
+        bool epoch_user_ok = (expected_user_id == 0)
+                             ? true
+                             : ((last_user_id == expected_user_id) &&
+                                (epoch_best_user_val >= STAGE2_CERTAINTY_THRESHOLD));
+
+        char dbg_line[160];
+        snprintf(dbg_line,
+                 sizeof(dbg_line),
+                 "ANNTRAIN word=%s epoch=%u target=%u%% phon=%u%% g=%c u=%c max_id=0x%02X user=%u",
+                 (word_label && word_label[0] != '\0') ? word_label : "<unknown>",
+                 (unsigned)(epoch + 1),
+                 (unsigned)((epoch_best_target_conf * 100u) / 255u),
+                 (unsigned)epoch_phoneme_order,
+                 epoch_gender_ok ? 'Y' : 'N',
+                 epoch_user_ok ? 'Y' : 'N',
+                 (unsigned)last_max_id,
+                 (unsigned)last_user_id);
+        ann_log_emit(log_username, dbg_line);
+
+        epochs_used = (uint8_t)(epoch + 1);
+        if (epoch_best_target_conf > best_target_conf) {
+            best_target_conf = epoch_best_target_conf;
+        }
+        if (epoch_phoneme_order > best_phoneme_order) {
+            best_phoneme_order = epoch_phoneme_order;
+        }
+        if (epoch_gender_ok) {
+            gender_pass = true;
+        }
+        if (epoch_user_ok) {
+            user_pass = true;
+        }
+
+        if (epoch_best_target_conf >= STAGE2_CERTAINTY_THRESHOLD &&
+            epoch_phoneme_order >= 80 &&
+            epoch_gender_ok &&
+            epoch_user_ok) {
+            break;
+        }
     }
 
     f_close(&file);
-    return true;
+
+    if (best_target_conf_out) *best_target_conf_out = best_target_conf;
+    if (best_phoneme_order_out) *best_phoneme_order_out = best_phoneme_order;
+    if (gender_pass_out) *gender_pass_out = gender_pass;
+    if (user_pass_out) *user_pass_out = user_pass;
+    if (last_max_id_out) *last_max_id_out = last_max_id;
+    if (last_user_id_out) *last_user_id_out = last_user_id;
+    if (epochs_used_out) *epochs_used_out = epochs_used;
+
+    return (best_target_conf >= STAGE2_CERTAINTY_THRESHOLD) &&
+           (best_phoneme_order >= 80) &&
+           gender_pass &&
+           user_pass;
 }
 
 static bool run_backprop_training(void) {
-    if (!sd_ready) return false;
+    if (!sd_ready || !current_user.set) return false;
 
-    DIR dir;
-    FILINFO fno;
-    if (f_opendir(&dir, "0:/microsd") != FR_OK) return false;
+    char user_path[128];
+    snprintf(user_path, sizeof(user_path), "0:/microsd/%s", current_user.username);
+
+    DIR udir;
+    FILINFO ufno;
+    if (f_opendir(&udir, user_path) != FR_OK) return false;
 
     uint8_t addr = (uint8_t)(STAGE2_BASE_ADDR + TRAIN_BEAM_INDEX);
     bool ok = true;
+    uint16_t trained_count = 0;
+    uint16_t passed_count = 0;
+    uint16_t failed_count = 0;
+    char last_result[21] = "Last: none";
 
-    while (f_readdir(&dir, &fno) == FR_OK && fno.fname[0] != 0) {
-        if (!(fno.fattrib & AM_DIR)) continue;
-        if (strcmp(fno.fname, ".") == 0 || strcmp(fno.fname, "..") == 0) continue;
-
-        char user_path[128];
-        snprintf(user_path, sizeof(user_path), "0:/microsd/%s", fno.fname);
-
-        DIR udir;
-        FILINFO ufno;
-        if (f_opendir(&udir, user_path) != FR_OK) continue;
-
-        while (f_readdir(&udir, &ufno) == FR_OK && ufno.fname[0] != 0) {
-            if (ufno.fattrib & AM_DIR) continue;
-            size_t len = strlen(ufno.fname);
-            if (len < 5 || strcmp(&ufno.fname[len - 4], ".cap") != 0) continue;
-
-            char cap_path[160];
-            snprintf(cap_path, sizeof(cap_path), "%s/%s", user_path, ufno.fname);
-
-            uint8_t target_id = SIL_WORD_ID;
-            char word_name[32];
-            strncpy(word_name, ufno.fname, sizeof(word_name) - 1);
-            word_name[sizeof(word_name) - 1] = '\0';
-            char *dot = strrchr(word_name, '.');
-            if (dot) *dot = '\0';
-            dict_target_from_word(word_name, &target_id);
-
-            if (!run_backprop_on_file(addr, cap_path, target_id)) {
-                ok = false;
-            }
-        }
+    // Freeze incoming stage-1 data while ANN training runs
+    if (!stage2_write_reg16(addr, STAGE2_REG_CONTROL, 0x0002)) {
         f_closedir(&udir);
+        return false;
     }
 
-    f_closedir(&dir);
-    if (!ok) return false;
+    while (f_readdir(&udir, &ufno) == FR_OK && ufno.fname[0] != 0) {
+        if (ufno.fattrib & AM_DIR) continue;
+        size_t len = strlen(ufno.fname);
+        if (len < 5 || strcmp(&ufno.fname[len - 4], ".dat") != 0) continue;
+
+        char cap_path[160];
+        snprintf(cap_path, sizeof(cap_path), "%s/%s", user_path, ufno.fname);
+
+        uint8_t target_id = SIL_WORD_ID;
+        uint8_t word_seq[PHONEME_SEQ_LEN] = {0};
+        uint8_t expected_phonemes[PHONEME_SEQ_LEN] = {0};
+        uint8_t expected_phoneme_count = 0;
+        char word_name[32];
+        strncpy(word_name, ufno.fname, sizeof(word_name) - 1);
+        word_name[sizeof(word_name) - 1] = '\0';
+        char *dot = strrchr(word_name, '.');
+        if (dot) *dot = '\0';
+        dict_target_from_word(word_name, &target_id);
+        if (dict_seq_from_word(word_name, word_seq)) {
+            expected_phoneme_count = build_expected_phoneme_list(word_seq,
+                                                                 expected_phonemes,
+                                                                 PHONEME_SEQ_LEN);
+        }
+        bool expected_gender_male = (strcasecmp_local(current_user.gender, "Male") == 0);
+
+        lcd_clear();
+        lcd_print_padded_line(0, "Stage 2 ANN Train");
+        char line1[21];
+        snprintf(line1, sizeof(line1), "Word:%s", word_name);
+        lcd_print_padded_line(1, line1);
+        lcd_print_padded_line(2, last_result);
+        char line3[21];
+        snprintf(line3, sizeof(line3), "Count:%u", (unsigned)(trained_count + 1));
+        lcd_print_padded_line(3, line3);
+
+        uint8_t best_conf = 0;
+        uint8_t best_phoneme_order = 0;
+        bool gender_ok = false;
+        bool user_ok = false;
+        uint8_t last_max_id = 0;
+        uint8_t last_user_id = 0;
+        uint8_t epochs_used = 0;
+        bool word_ok = run_backprop_on_file(addr,
+                                            cap_path,
+                                            word_name,
+                                            current_user.username,
+                                            target_id,
+                            expected_phonemes,
+                            expected_phoneme_count,
+                            current_user.user_id,
+                            expected_gender_male,
+                                            &best_conf,
+                            &best_phoneme_order,
+                            &gender_ok,
+                            &user_ok,
+                                            &last_max_id,
+                                            &last_user_id,
+                                            &epochs_used);
+        trained_count++;
+
+        if (word_ok) {
+            passed_count++;
+            snprintf(last_result,
+                     sizeof(last_result),
+                     "Last:%3u%% E%u",
+                     (unsigned)((best_conf * 100u) / 255u),
+                     (unsigned)epochs_used);
+        } else {
+            failed_count++;
+            snprintf(last_result,
+                     sizeof(last_result),
+                     "Last:%3u%% M%02X",
+                     (unsigned)((best_conf * 100u) / 255u),
+                     (unsigned)last_max_id);
+            ok = false;
+        }
+
+        char word_summary[200];
+        snprintf(word_summary,
+                 sizeof(word_summary),
+                 "ANNTRAIN_SUMMARY word=%s result=%s target=%u%% phon=%u%% g=%c u=%c epochs=%u max_id=0x%02X user=%u",
+                 word_name,
+                 word_ok ? "PASS" : "FAIL",
+                 (unsigned)((best_conf * 100u) / 255u),
+                 (unsigned)best_phoneme_order,
+                 gender_ok ? 'Y' : 'N',
+                 user_ok ? 'Y' : 'N',
+                 (unsigned)epochs_used,
+                 (unsigned)last_max_id,
+                 (unsigned)last_user_id);
+        ann_log_emit(current_user.username, word_summary);
+
+        lcd_clear();
+        lcd_print_padded_line(0, "Stage 2 ANN Train");
+        char done_line1[21];
+        snprintf(done_line1, sizeof(done_line1), "Word:%s", word_name);
+        lcd_print_padded_line(1, done_line1);
+        char done_line2[21];
+        snprintf(done_line2,
+                 sizeof(done_line2),
+                 "T:%3u%% U:%u",
+                 (unsigned)((best_conf * 100u) / 255u),
+                 (unsigned)last_user_id);
+        lcd_print_padded_line(2, done_line2);
+        lcd_print_padded_line(3, last_result);
+    }
+
+    f_closedir(&udir);
+
+    stage2_write_reg16(addr, STAGE2_REG_CONTROL, 0x0000);
+
+    char overall_summary[220];
+    snprintf(overall_summary,
+             sizeof(overall_summary),
+             "ANNTRAIN_DONE user=%s total=%u pass=%u fail=%u",
+             current_user.username,
+             (unsigned)trained_count,
+             (unsigned)passed_count,
+             (unsigned)failed_count);
+    ann_log_emit(current_user.username, overall_summary);
+
+    if (!ok || trained_count == 0) return false;
 
     char nn_path[64];
-    if (!stage2_save_nn_to_sd(addr, nn_path, sizeof(nn_path))) return false;
+    if (!stage2_save_nn_to_sd(addr, nn_path, sizeof(nn_path), false)) return false;
 
     for (uint8_t i = 0; i < STAGE2_COUNT; i++) {
         if (i == TRAIN_BEAM_INDEX) continue;
@@ -2208,9 +3309,16 @@ static void menu_handle_key(char key) {
             } else if (menu_main_page == 0 && key == '2') {
                 menu_state = MENU_SELECT_USER;
                 user_menu_start();
-            } else if (menu_main_page == 1 && key == '3') {
-                menu_state = MENU_TRAIN_CAPTURE;
-                training_start();
+            } else if (menu_main_page == 0 && key == '3') {
+                if (current_user.set) {
+                    menu_state = MENU_TRAIN_CAPTURE;
+                    training_start();
+                    menu_render_training_menu();
+                } else {
+                    lcd_set_status("Status: select user");
+                    menu_state = MENU_SCREEN0;
+                    menu_render_screen0();
+                }
             } else if (menu_main_page == 1 && key == '4') {
                 load_unrecognised_preview();
                 menu_state = MENU_SELECT_UNREC;
@@ -2220,7 +3328,7 @@ static void menu_handle_key(char key) {
                 lcd_clear();
                 lcd_set_cursor(0, 0);
                 lcd_print("SpeechGen Train");
-                if (run_backprop_training()) {
+                if (run_speech_generator_training()) {
                     lcd_set_cursor(0, 1);
                     lcd_print("Done");
                     lcd_set_status("Status: SG train OK");
@@ -2230,13 +3338,36 @@ static void menu_handle_key(char key) {
                     lcd_set_status("Status: SG train fail");
                 }
                 sleep_ms(1200);
-                menu_state = MENU_SCREEN0;
-                menu_render_screen0();
+                menu_state = MENU_MAIN;
+                menu_main_page = 1;
+                menu_render_main();
+            } else if (menu_main_page == 1 && key == '6') {
+                menu_state = MENU_STAGE2_ANN_CONFIRM;
+                menu_render_stage2_ann_confirm();
+            } else if (menu_main_page == 2 && key == '7') {
+                menu_state = MENU_SAVE_ANN_CONFIRM;
+                menu_render_save_ann_confirm();
+            } else if (menu_main_page == 2 && key == '8') {
+                if (!load_ann_menu_start()) {
+                    lcd_set_status("Status: ANN list err");
+                    menu_state = MENU_MAIN;
+                    menu_main_page = 2;
+                    menu_render_main();
+                } else {
+                    menu_state = MENU_LOAD_ANN_SELECT;
+                    menu_render_load_ann_select();
+                }
             } else if (key == 'B' && menu_main_page == 0) {
                 menu_main_page = 1;
                 menu_render_main();
+            } else if (key == 'B' && menu_main_page == 1) {
+                menu_main_page = 2;
+                menu_render_main();
             } else if (key == 'A' && menu_main_page == 1) {
                 menu_main_page = 0;
+                menu_render_main();
+            } else if (key == 'A' && menu_main_page == 2) {
+                menu_main_page = 1;
                 menu_render_main();
             } else if (key == '*') {
                 menu_state = MENU_SCREEN0;
@@ -2258,6 +3389,7 @@ static void menu_handle_key(char key) {
                                             user_menu_ids[user_menu_index],
                                             current_user.username,
                                             sizeof(current_user.username));
+                    current_user.user_id = user_menu_ids[user_menu_index];
                     strncpy(current_user.full_name, user_menu_names[user_menu_index], sizeof(current_user.full_name) - 1);
                     current_user.full_name[sizeof(current_user.full_name) - 1] = '\0';
                     current_user.set = true;
@@ -2328,6 +3460,7 @@ static void menu_handle_key(char key) {
                 } else if (key == '#') {
                     memset(&current_user, 0, sizeof(current_user));
                     make_username_from_name(add_user_name, add_user_id, current_user.username, sizeof(current_user.username));
+                    current_user.user_id = add_user_id;
                     strncpy(current_user.full_name, add_user_name, sizeof(current_user.full_name) - 1);
                     current_user.full_name[sizeof(current_user.full_name) - 1] = '\0';
                     strncpy(current_user.gender, add_user_gender_male ? "Male" : "Female", sizeof(current_user.gender) - 1);
@@ -2372,12 +3505,139 @@ static void menu_handle_key(char key) {
 
         case MENU_TRAIN_CAPTURE:
             if (key == '*') {
-                training_stop();
+                training_abort_to_main();
                 lcd_set_status("Status: training stop");
-                menu_state = MENU_SCREEN0;
-                menu_render_screen0();
+                break;
+            }
+
+            if (!training_words_loaded || training_word_count == 0) {
+                break;
+            }
+
+            if (train_state == TRAIN_IDLE) {
+                if (key == 'A' || key == 'C') {
+                    training_word_index = (training_word_index == 0)
+                                           ? (uint16_t)(training_word_count - 1)
+                                           : (uint16_t)(training_word_index - 1);
+                    menu_render_training_menu();
+                } else if (key == 'B' || key == 'D') {
+                    training_word_index = (uint16_t)((training_word_index + 1) % training_word_count);
+                    menu_render_training_menu();
+                } else if (key == '#') {
+                    if (!training_begin_capture()) {
+                        lcd_set_status("Status: train start err");
+                        menu_render_training_menu();
+                    }
+                }
             }
             break;
+
+        case MENU_STAGE2_ANN_CONFIRM:
+            if (key == '*') {
+                menu_state = MENU_MAIN;
+                menu_main_page = 1;
+                menu_render_main();
+            } else if (key == '#') {
+                lcd_clear();
+                lcd_print_padded_line(0, "Stage 2 ANN Train");
+                lcd_print_padded_line(1, "Starting...");
+                lcd_print_padded_line(2, "");
+                lcd_print_padded_line(3, "");
+
+                bool ann_ok = run_backprop_training();
+                if (ann_ok) {
+                    lcd_set_status("Status: ANN train OK");
+                } else {
+                    lcd_set_status("Status: ANN train FAIL");
+                }
+
+                sleep_ms(1200);
+                menu_state = MENU_MAIN;
+                menu_main_page = 1;
+                menu_render_main();
+            }
+            break;
+
+        case MENU_SAVE_ANN_CONFIRM:
+            if (key == '*') {
+                menu_state = MENU_MAIN;
+                menu_main_page = 2;
+                menu_render_main();
+            } else if (key == '#') {
+                uint8_t addr = (uint8_t)(STAGE2_BASE_ADDR + TRAIN_BEAM_INDEX);
+                char ann_path[80];
+                bool save_ok = stage2_save_nn_to_sd(addr, ann_path, sizeof(ann_path), true);
+
+                uint8_t version = 0;
+                nn_version_from_path(ann_path, &version);
+                if (save_ok) {
+                    lcd_set_status("Status: ANN save OK");
+                    lcd_clear();
+                    char line0[21];
+                    snprintf(line0, sizeof(line0), "Saved ANN v%02u", (unsigned)version);
+                    lcd_print_padded_line(0, line0);
+                    lcd_print_padded_line(1, "RecognizerANN file");
+                    lcd_print_padded_line(2, "Save complete");
+                    lcd_print_padded_line(3, "Returning menu...");
+                } else {
+                    lcd_set_status("Status: ANN save FAIL");
+                    lcd_clear();
+                    lcd_print_padded_line(0, "Save ANN Failed");
+                    lcd_print_padded_line(1, "Check Stage2/SD");
+                    lcd_print_padded_line(2, "");
+                    lcd_print_padded_line(3, "Returning menu...");
+                }
+
+                sleep_ms(1200);
+                menu_state = MENU_MAIN;
+                menu_main_page = 2;
+                menu_render_main();
+            }
+            break;
+
+        case MENU_LOAD_ANN_SELECT:
+            if (key == '*') {
+                menu_state = MENU_MAIN;
+                menu_main_page = 2;
+                menu_render_main();
+            } else if (ann_version_count > 0 && (key == 'A' || key == 'B')) {
+                if (key == 'A') {
+                    ann_version_index = (ann_version_index == 0)
+                                            ? (uint8_t)(ann_version_count - 1)
+                                            : (uint8_t)(ann_version_index - 1);
+                } else {
+                    ann_version_index = (uint8_t)((ann_version_index + 1) % ann_version_count);
+                }
+                menu_render_load_ann_select();
+            } else if (ann_version_count > 0 && key == '#') {
+                uint8_t selected_version = ann_versions[ann_version_index];
+                bool load_ok = load_ann_to_all_stage2(selected_version);
+
+                if (load_ok) {
+                    lcd_set_status("Status: ANN load OK");
+                    lcd_clear();
+                    char line0[21];
+                    snprintf(line0, sizeof(line0), "Loaded ANN v%02u", (unsigned)selected_version);
+                    lcd_print_padded_line(0, line0);
+                    lcd_print_padded_line(1, "All Stage2 updated");
+                    lcd_print_padded_line(2, "Upload complete");
+                    lcd_print_padded_line(3, "Returning menu...");
+                } else {
+                    lcd_set_status("Status: ANN load FAIL");
+                    lcd_clear();
+                    lcd_print_padded_line(0, "Load ANN Failed");
+                    lcd_print_padded_line(1, "Check file/I2C");
+                    lcd_print_padded_line(2, "");
+                    lcd_print_padded_line(3, "Returning menu...");
+                }
+
+                sleep_ms(1200);
+                menu_state = MENU_MAIN;
+                menu_main_page = 2;
+                menu_render_main();
+            }
+            break;
+
         default:
             break;
     }

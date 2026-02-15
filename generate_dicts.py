@@ -3,10 +3,11 @@
 
 Dictionary.dat text record format (fixed width):
     15 two-digit hex values plus trailing spaces (45 chars)
+    + 2-digit hex language ID + space (3 chars)
     + word field padded with spaces to 26 chars
     + CRLF
 
-Record length = 73 bytes, which keeps binary-search indexing simple.
+Record length = 76 bytes, which keeps binary-search indexing simple.
 """
 
 import sys
@@ -15,8 +16,10 @@ import os
 # Record sizes
 DICT_HEX_COUNT = 15
 DICT_HEX_FIELD_CHARS = 45
+DICT_LANG_ID_CHARS = 2
+DICT_LANG_SEP_CHARS = 1
 DICT_WORD_SIZE = 26
-DICT_RECORD_SIZE = DICT_HEX_FIELD_CHARS + DICT_WORD_SIZE + 2
+DICT_RECORD_SIZE = DICT_HEX_FIELD_CHARS + DICT_LANG_ID_CHARS + DICT_LANG_SEP_CHARS + DICT_WORD_SIZE + 2
 
 DICT_PHONEME_SIZE = 15
 
@@ -58,7 +61,7 @@ def create_language_dat(output_path):
     return True
 
 
-def create_dictionary_dat(input_file, output_path, language_id=1):
+def create_dictionary_dat(input_file, output_path, language_id=0):
     """
     Create Dictionary.dat as an empty fixed-width text file.
     """
@@ -72,7 +75,7 @@ def create_dictionary_dat(input_file, output_path, language_id=1):
     return True
 
 
-def format_dict_record(phoneme_seq, word):
+def format_dict_record(phoneme_seq, word, language_id=0):
     """Build one fixed-width Dictionary.dat record (as bytes)."""
     if len(phoneme_seq) != DICT_PHONEME_SIZE:
         raise ValueError(f"Phoneme sequence must be {DICT_PHONEME_SIZE} bytes")
@@ -80,16 +83,19 @@ def format_dict_record(phoneme_seq, word):
     if len(word) > DICT_WORD_SIZE:
         raise ValueError(f"Word too long (max {DICT_WORD_SIZE} chars)")
 
+    if language_id < 0 or language_id > 255:
+        raise ValueError("language_id must be 0..255")
+
     hex_part = ''.join(f"{b:02X} " for b in phoneme_seq)  # 45 chars with trailing space
     if len(hex_part) != DICT_HEX_FIELD_CHARS:
         raise ValueError("Internal format error: bad hex field length")
 
     word_part = word.ljust(DICT_WORD_SIZE, ' ')
-    line = f"{hex_part}{word_part}\r\n"
+    line = f"{hex_part}{language_id:02X} {word_part}\r\n"
     return line.encode('ascii')
 
 
-def add_dictionary_entry(output_path, phoneme_seq, word, language_id=1):
+def add_dictionary_entry(output_path, phoneme_seq, word, language_id=0):
     """
     Add a single entry to Dictionary.dat (append mode).
     
@@ -97,13 +103,12 @@ def add_dictionary_entry(output_path, phoneme_seq, word, language_id=1):
         output_path: Path to Dictionary.dat
         phoneme_seq: List of 15 phoneme IDs (bytes)
         word: Word string (max 25 chars)
-        language_id: Language ID (default 1 = English)
+        language_id: Language ID (default 0 = Unknown)
     """
     if len(phoneme_seq) != DICT_PHONEME_SIZE:
         raise ValueError(f"Phoneme sequence must be {DICT_PHONEME_SIZE} bytes")
     
-    _ = language_id  # kept for call compatibility; format no longer stores language ID
-    record = format_dict_record(phoneme_seq, word)
+    record = format_dict_record(phoneme_seq, word, language_id=language_id)
 
     with open(output_path, 'ab') as f:
         f.write(record)
@@ -124,11 +129,14 @@ def print_dictionary_entry(data):
     line = data.decode('ascii', errors='ignore')
 
     hex_part = line[:DICT_HEX_FIELD_CHARS]
-    word = line[DICT_HEX_FIELD_CHARS:DICT_HEX_FIELD_CHARS + DICT_WORD_SIZE].rstrip(' ')
+    lang_hex = line[DICT_HEX_FIELD_CHARS:DICT_HEX_FIELD_CHARS + DICT_LANG_ID_CHARS]
+    word = line[DICT_HEX_FIELD_CHARS + DICT_LANG_ID_CHARS + DICT_LANG_SEP_CHARS:
+                DICT_HEX_FIELD_CHARS + DICT_LANG_ID_CHARS + DICT_LANG_SEP_CHARS + DICT_WORD_SIZE].rstrip(' ')
     phoneme_seq = hex_part.strip().split(' ')
     
     return {
         'phoneme_seq': ' '.join(phoneme_seq),
+        'language_id': int(lang_hex, 16) if lang_hex.strip() else 0,
         'word': word
     }
 
@@ -184,6 +192,8 @@ def main():
     print(f"    - 2 chars: CRLF")
     print(f"  Dictionary.dat: {DICT_RECORD_SIZE} bytes per record")
     print(f"    - 45 chars: 15 hex phoneme IDs (00-FF) separated by spaces")
+    print(f"    - 2 chars: Language ID in hex (00-FF)")
+    print(f"    - 1 char: Space separator")
     print(f"    - 26 chars: Word (space padded)")
     print(f"    - 2 chars: CRLF")
 

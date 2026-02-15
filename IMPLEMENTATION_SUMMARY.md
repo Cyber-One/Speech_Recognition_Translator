@@ -153,7 +153,7 @@ Next Unknown Word:
    - Faster: Single append operation
 
 3. **generate_sample_words()**
-  - Updated for 73-byte fixed-width text format (Dictionary.dat only)
+   - Updated for 73-byte fixed-width text format (Dictionary.dat only)
    - Preserved sort order requirement
 
 4. **dict_target_from_word()**
